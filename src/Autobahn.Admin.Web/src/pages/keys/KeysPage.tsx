@@ -198,7 +198,7 @@ export default function KeysPage() {
     <section class="page" id="panel-keys" data-solid-root="keys">
       <div class="page-header">
         <div class="titles">
-          {null}
+          
           <h2>API keys</h2>
         </div>
         <div class="page-actions">
@@ -245,9 +245,7 @@ export default function KeysPage() {
         </Button>
       </div>
 
-      <Show when={store.totalMatches() > store.capped().length}>
-        {null}
-      </Show>
+      
 
       <div class="table-wrap">
         <table class="data-table t-keys" classList={{ 'has-tenant': multiTenant() }}>

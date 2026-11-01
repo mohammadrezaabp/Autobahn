@@ -43,7 +43,7 @@ export function KeyModelAccessDrawer() {
       <Show when={!grants.loading()}>
         <Show when={grants.providers()?.length}>
           <h4 class="ka-step">1. Providers</h4>
-          {null}
+          
           <For each={grants.providers() ?? []}>
             {(p) => (
               <>
@@ -57,12 +57,8 @@ export function KeyModelAccessDrawer() {
                   <span>{p.displayName}</span>
                   <span class="tag level-warning">Paid</span>
                 </label>
-                <Show when={!p.tenantOpen}>
-                  {null}
-                </Show>
-                <Show when={p.forwardable === false}>
-                  {null}
-                </Show>
+                
+                
                 <Show when={p.tenantOpen && grants.isProviderOpen(p.provider)}>
                   <div class="ka-cap">
                     <label for={`ka-cap-${p.provider}`}>Monthly cap (USD)</label>
@@ -78,7 +74,7 @@ export function KeyModelAccessDrawer() {
                   <Show when={parseKeyCap(grants.providerCap(p.provider), p.tenantMonthlyCapUsd).error}>
                     <p class="field-error">{parseKeyCap(grants.providerCap(p.provider), p.tenantMonthlyCapUsd).error}</p>
                   </Show>
-                  {null}
+                  
                 </Show>
               </>
             )}
@@ -86,7 +82,7 @@ export function KeyModelAccessDrawer() {
         </Show>
 
         <h4 class="ka-step">{grants.providers()?.length ? '2. Models' : 'Models'}</h4>
-        {null}
+        
         <ModelMultiSelect
           choices={grants.choices()}
           selected={grants.selected()}
@@ -115,7 +111,7 @@ export function KeyModelAccessDrawer() {
           />
           <Button type="submit" variant="secondary" size="sm">Add prefix</Button>
         </form>
-        {null}
+        
         <Show when={prefixError()}><p class="field-error">{prefixError()}</p></Show>
         <Show when={prefixes().length > 0}>
           <ul class="msel-chips" aria-label="Prefixes">
@@ -131,7 +127,7 @@ export function KeyModelAccessDrawer() {
         </Show>
 
         <Show when={grants.patterns().length > 0}>
-          {null}
+          
           <ModelMultiSelect
             label="Hold back models"
             choices={grants.deniedChoices()}
@@ -140,9 +136,7 @@ export function KeyModelAccessDrawer() {
           />
         </Show>
 
-        <Show when={removed() > 0}>
-          {null}
-        </Show>
+        
 
         <p class="notice" classList={{ warn: grants.selected().length === 0 && grants.patterns().length === 0 }}>
           {grants.summary()}
@@ -151,7 +145,7 @@ export function KeyModelAccessDrawer() {
 
         <Show when={grants.providers()}>
           <h4 class="ka-step">Check a model</h4>
-          {null}
+          
           <form class="ka-prefix" onSubmit={(e) => { e.preventDefault(); void checkModel(probe()); }}>
             <input
               type="text"

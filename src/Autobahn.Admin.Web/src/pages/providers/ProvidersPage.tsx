@@ -32,9 +32,9 @@ export default function ProvidersPage() {
     <section class="page" id="panel-providers">
       <header class="page-header">
         <div class="titles">
-          {null}
+          
           <h2>Providers</h2>
-          {null}
+          
         </div>
         <div class="page-actions">
           <Button variant="secondary" onClick={() => void loadProviders()} disabled={store.loading()}>
@@ -122,7 +122,7 @@ export default function ProvidersPage() {
             </tbody>
           </table>
         </div>
-        {null}
+        
       </Show>
     </section>
   );

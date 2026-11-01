@@ -165,7 +165,8 @@ public static class GatewayPanelsEndpoints
         // Both tools resolve their assets relative to the trailing slash.
         if (string.Equals(context.Request.Path.Value, panel.PathPrefix, StringComparison.OrdinalIgnoreCase))
         {
-            context.Response.Redirect(panel.PathPrefix + "/" + context.Request.QueryString);
+            await Results.LocalRedirect(panel.PathPrefix + "/" + context.Request.QueryString)
+                .ExecuteAsync(context).ConfigureAwait(false);
             return;
         }
 
