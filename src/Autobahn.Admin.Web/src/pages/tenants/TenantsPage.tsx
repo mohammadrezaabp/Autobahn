@@ -105,9 +105,9 @@ export default function TenantsPage() {
     <section class="page" id="panel-tenants">
       <header class="page-header">
         <div class="titles">
-          {null}
+          
           <h2>Tenants</h2>
-          {null}
+          
         </div>
         <Show when={store.operator()}>
           <div class="page-actions">

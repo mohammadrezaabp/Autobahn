@@ -134,6 +134,20 @@ public sealed class AdminPanelsEndpointTests : IAsyncLifetime
         _upstream.Requests.Should().BeEmpty();
     }
 
+    [Theory]
+    [InlineData("?next=https://outside.example/")]
+    [InlineData("?next=%2F%2Foutside.example%2F")]
+    public async Task PanelRedirectStaysLocalWithAnExternalLookingQuery(string query)
+    {
+        using var client = _factory.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+        client.DefaultRequestHeaders.Add("X-API-Key", GatewayWebApplicationFactory.DefaultAdminApiKey);
+        var response = await client.GetAsync("/admin/prometheus" + query);
+        response.StatusCode.Should().Be(HttpStatusCode.Redirect);
+        response.Headers.Location!.IsAbsoluteUri.Should().BeFalse();
+        response.Headers.Location.OriginalString.Should().Be("/admin/prometheus/" + query);
+        _upstream.Requests.Should().BeEmpty();
+    }
+
     [Fact]
     public async Task Panel_WithATamperedSession_IsRefused()
     {
