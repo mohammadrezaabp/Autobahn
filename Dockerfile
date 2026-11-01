@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS web
+FROM node:26-bookworm-slim AS web
 WORKDIR /work
 COPY design ./design
 COPY src/Autobahn.Admin.Web ./src/Autobahn.Admin.Web
