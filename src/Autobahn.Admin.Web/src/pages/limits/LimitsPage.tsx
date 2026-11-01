@@ -62,9 +62,9 @@ export default function LimitsPage() {
     <section class="page" id="panel-limits">
       <header class="page-header">
         <div class="titles">
-          {null}
+          
           <h2>Limits</h2>
-          {null}
+          
         </div>
         <div class="page-actions">
           <Button variant="secondary" onClick={() => loadAll(true)} disabled={store.loading()}>
@@ -96,7 +96,7 @@ export default function LimitsPage() {
                   {(e) => (
                     <>
                       <TenantLimitFigures tier={e().tier} />
-                      {null}
+                      
                     </>
                   )}
                 </Show>
@@ -107,7 +107,7 @@ export default function LimitsPage() {
               <div class="rl-section-head">
                 <div>
                   <h3>Limits on this tenant and its keys ({formatNum(rules().length)})</h3>
-                  {null}
+                  
                 </div>
               </div>
               <div class="table-wrap card">
@@ -149,7 +149,7 @@ export default function LimitsPage() {
                   <p class="hint rl-no-match flush">No key limits configured.</p>
                 </Show>
               </div>
-              {null}
+              
             </div>
           </div>
         )}

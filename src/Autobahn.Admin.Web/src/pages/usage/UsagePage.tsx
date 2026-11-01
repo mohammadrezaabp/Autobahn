@@ -92,9 +92,9 @@ export default function UsagePage() {
     <section class="page" id="panel-usage">
       <header class="page-header">
         <div class="titles">
-          {null}
+          
           <h2>Usage &amp; cost</h2>
-          {null}
+          
         </div>
       </header>
 

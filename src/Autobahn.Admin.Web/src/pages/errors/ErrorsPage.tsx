@@ -133,9 +133,9 @@ export default function ErrorsPage() {
     <section class="page" id="panel-errors">
       <div class="page-header">
         <div class="titles">
-          {null}
+          
           <h2>Errors</h2>
-          {null}
+          
           <Show when={store.groupsTotal() > 0}>
             <p class="page-sub">
               {formatNum(occurrenceTotal())} occurrences across {formatNum(store.groupsTotal())} error groups · {rangeLabel()}
@@ -298,9 +298,7 @@ export default function ErrorsPage() {
                               <span>{String(row().hint)}</span>
                             </p>
                           </Show>
-                          <Show when={!(row().modelId || hasEndpoint() || row().statusCode || requestId())}>
-                            {null}
-                          </Show>
+                          
                           <dl class="request-detail-list">
                             <Show when={row().source}><div><dt>Source</dt><dd>{sourceLabel(row().source)}</dd></div></Show>
                             <Show when={row().category}><div><dt>Reported by</dt><dd><code>{String(row().category)}</code></dd></div></Show>
