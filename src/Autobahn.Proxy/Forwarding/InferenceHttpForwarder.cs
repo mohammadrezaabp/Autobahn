@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Autobahn.Application.Abstractions;
+using Autobahn.Application.Diagnostics;
 using Autobahn.Domain.Configuration;
 using Autobahn.Application.Errors;
 using Autobahn.Application.Forwarding;
@@ -51,8 +52,8 @@ public sealed class InferenceHttpForwarder(IHttpClientFactory httpClientFactory,
         await transformer.TransformRequestAsync(context, requestMessage, destinationPrefix, cancellationToken).ConfigureAwait(false);
         var client = httpClientFactory.CreateClient(HttpClientName);
         // ResponseHeadersRead in both modes. Buffering a non-streaming response held the whole body
-        // in memory before a single byte could be forwarded, and — because the buffering happened
-        // inside SendAsync — it charged the transfer of a large body against the header deadline,
+        // in memory before a single byte could be forwarded, and â€” because the buffering happened
+        // inside SendAsync â€” it charged the transfer of a large body against the header deadline,
         // where a breach is recorded as backend ill health.
         const HttpCompletionOption completionOption = HttpCompletionOption.ResponseHeadersRead;
         // Header phase. Only this stretch carries the header deadline; for both modes SendAsync
@@ -73,13 +74,13 @@ public sealed class InferenceHttpForwarder(IHttpClientFactory httpClientFactory,
         }
         catch (OperationCanceledException)when (headerCts.IsCancellationRequested)
         {
-            logger.LogWarning("Upstream did not return response headers within {HeaderTimeoutSeconds}s for {Method} {Uri}", timeouts.HeaderTimeout.TotalSeconds, requestMessage.Method, requestMessage.RequestUri);
+            logger.LogWarning("Upstream did not return response headers within {HeaderTimeoutSeconds}s for {Method} {Uri}", timeouts.HeaderTimeout.TotalSeconds, LogText.OneLine(requestMessage.Method.Method), LogText.Endpoint(requestMessage.RequestUri));
             StashException(context, new TimeoutException($"Upstream did not return response headers within {timeouts.HeaderTimeout.TotalSeconds}s."));
             return ForwarderError.RequestTimedOut;
         }
         catch (HttpRequestException ex)
         {
-            logger.LogWarning(ex, "Upstream HTTP request failed for {Method} {Uri}", requestMessage.Method, requestMessage.RequestUri);
+            logger.LogWarning(ex, "Upstream HTTP request failed for {Method} {Uri}", LogText.OneLine(requestMessage.Method.Method), LogText.Endpoint(requestMessage.RequestUri));
             StashException(context, ex);
             return ForwarderError.Request;
         }
@@ -87,7 +88,7 @@ public sealed class InferenceHttpForwarder(IHttpClientFactory httpClientFactory,
         // Headers are in, so the header allowance has done its job: disarm it rather than leaving a
         // timer to fire minutes later against a token nothing observes any more.
         //
-        // Not a correctness fix on the current runtime — with ResponseHeadersRead, SocketsHttpHandler
+        // Not a correctness fix on the current runtime â€” with ResponseHeadersRead, SocketsHttpHandler
         // does not tear the response body down when the send token is cancelled after the headers
         // have been read (verified against a real socket in InferenceHttpForwarderLoopbackTests).
         // It is still wrong to leave armed: it costs a pointless timer per in-flight request, and it
@@ -135,7 +136,7 @@ public sealed class InferenceHttpForwarder(IHttpClientFactory httpClientFactory,
                 //
                 // The first byte gets whatever the header allowance left unused, and never less than
                 // the idle gap. An SSE upstream returns its headers the moment it accepts the
-                // request — before scheduling, before prefill — so for a streaming request the
+                // request â€” before scheduling, before prefill â€” so for a streaming request the
                 // header allowance was spent in milliseconds and the wait for the first token fell
                 // to the idle gap alone: a hard 120 s time-to-first-token ceiling, however large the
                 // prompt, and however far ForRequestBody had widened the header allowance for it.
@@ -148,8 +149,8 @@ public sealed class InferenceHttpForwarder(IHttpClientFactory httpClientFactory,
                 //
                 // The deadline covers the upstream read only. The write to the client carries its own,
                 // separately classified bound (EffectiveDownstreamWriteTimeout), because the two
-                // measure different faults: charging a client's refusal to read to the upstream — as
-                // one shared token did — reported a slow client as an upstream stall, while leaving
+                // measure different faults: charging a client's refusal to read to the upstream â€” as
+                // one shared token did â€” reported a slow client as an upstream stall, while leaving
                 // the write on the client's abort token alone made it unbounded unless the host
                 // happened to enforce a response data rate.
                 var firstByteAllowance = timeouts.FirstByteTimeout(Stopwatch.GetElapsedTime(headerPhaseStarted));
@@ -183,12 +184,12 @@ public sealed class InferenceHttpForwarder(IHttpClientFactory httpClientFactory,
                     // outcome name is the same for both; the message and the byte count are not.
                     if (progress.BytesForwarded == 0)
                     {
-                        logger.LogWarning("Upstream returned headers but no response body byte within {FirstByteAllowanceSeconds}s for {Uri}", firstByteAllowance.TotalSeconds, requestMessage.RequestUri);
+                        logger.LogWarning("Upstream returned headers but no response body byte within {FirstByteAllowanceSeconds}s for {Uri}", firstByteAllowance.TotalSeconds, LogText.Endpoint(requestMessage.RequestUri));
                         StashException(context, new TimeoutException($"Upstream returned response headers but no response body byte within {firstByteAllowance.TotalSeconds:0.#}s (time to first token exceeded the allowance)."));
                     }
                     else
                     {
-                        logger.LogWarning("Upstream stalled for more than {StreamIdleTimeoutSeconds}s while sending the response body for {Uri}, after {BytesForwarded} bytes had reached the client", timeouts.StreamIdleTimeout.TotalSeconds, requestMessage.RequestUri, progress.BytesForwarded);
+                        logger.LogWarning("Upstream stalled for more than {StreamIdleTimeoutSeconds}s while sending the response body for {Uri}, after {BytesForwarded} bytes had reached the client", timeouts.StreamIdleTimeout.TotalSeconds, LogText.Endpoint(requestMessage.RequestUri), progress.BytesForwarded);
                         StashException(context, new TimeoutException($"Upstream stalled for more than {timeouts.StreamIdleTimeout.TotalSeconds:0.#}s while sending the response body, after {progress.BytesForwarded} bytes had reached the client."));
                     }
 
@@ -198,11 +199,11 @@ public sealed class InferenceHttpForwarder(IHttpClientFactory httpClientFactory,
                 catch (DownstreamWriteTimeoutException ex)
                 {
                     // The client stopped reading. Backpressure reaches all the way to the upstream
-                    // read, so the whole forward — upstream connection, bulkhead slot, budget
-                    // reservation — was being held by the client rather than by the backend. Reported
+                    // read, so the whole forward â€” upstream connection, bulkhead slot, budget
+                    // reservation â€” was being held by the client rather than by the backend. Reported
                     // as a client-side body failure so it is never counted against the breaker, and
                     // kept distinct from a clean disconnect, which needs no operator attention.
-                    logger.LogWarning("Client stopped reading the response body for {Method} {Uri}; gave up after {DownstreamWriteTimeoutSeconds}s with {BytesForwarded} bytes delivered", requestMessage.Method, requestMessage.RequestUri, ex.Timeout.TotalSeconds, progress.BytesForwarded);
+                    logger.LogWarning("Client stopped reading the response body for {Method} {Uri}; gave up after {DownstreamWriteTimeoutSeconds}s with {BytesForwarded} bytes delivered", LogText.OneLine(requestMessage.Method.Method), LogText.Endpoint(requestMessage.RequestUri), ex.Timeout.TotalSeconds, progress.BytesForwarded);
                     RemoveCopiedHeadersIfNotStarted(context, copiedHeaderNames);
                     StashException(context, ex);
                     return ForwarderError.ResponseBodyClient;
@@ -211,10 +212,10 @@ public sealed class InferenceHttpForwarder(IHttpClientFactory httpClientFactory,
                 {
                     // The upstream answered and then broke the body off: connection reset, premature
                     // EOF, bad chunk framing. Unlike a client hang-up this is the backend's doing, so
-                    // it is reported as a backend failure — otherwise a flapping backend that drops
+                    // it is reported as a backend failure â€” otherwise a flapping backend that drops
                     // connections mid-response was invisible to the breaker and to the operator, and
                     // a non-streaming client got the upstream's 200 with a truncated body.
-                    logger.LogWarning(ex.InnerException, "Upstream response body failed mid-transfer for {Method} {Uri}", requestMessage.Method, requestMessage.RequestUri);
+                    logger.LogWarning(ex.InnerException, "Upstream response body failed mid-transfer for {Method} {Uri}", LogText.OneLine(requestMessage.Method.Method), LogText.Endpoint(requestMessage.RequestUri));
                     RemoveCopiedHeadersIfNotStarted(context, copiedHeaderNames);
                     StashException(context, ex.InnerException ?? ex);
                     return ForwarderError.ResponseBodyDestination;
@@ -233,7 +234,7 @@ public sealed class InferenceHttpForwarder(IHttpClientFactory httpClientFactory,
             catch (IOException)
             {
                 // Writing to the client failed: the client disconnected while receiving the body.
-                // Reads from the upstream never surface here — they are wrapped above.
+                // Reads from the upstream never surface here â€” they are wrapped above.
                 return ForwarderError.RequestCanceled;
             }
             finally
@@ -453,7 +454,7 @@ public sealed class InferenceHttpForwarder(IHttpClientFactory httpClientFactory,
     /// <param name = "clientAlreadyGone">The client left before the body phase; nothing is written.</param>
     /// <exception cref = "DownstreamWriteTimeoutException">
     /// A single write to the client outlived <paramref name = "downstreamWriteTimeout"/> without the
-    /// client having disconnected — it is still holding the socket open and not reading.
+    /// client having disconnected â€” it is still holding the socket open and not reading.
     /// </exception>
     /// <exception cref = "UpstreamBodyReadException">
     /// The upstream read failed with an <see cref = "IOException"/> (which includes
@@ -577,7 +578,7 @@ public sealed class InferenceHttpForwarder(IHttpClientFactory httpClientFactory,
     /// <para>Rearming reschedules a timer, and a token stream forwards a chunk several times a
     /// second, so a rearm is skipped while the last one is younger than a quarter of the gap (at most
     /// one second). Skipping only ever makes the deadline fire <em>earlier</em> than the configured
-    /// gap — by at most that floor — so a healthy stream is never cut short by it. The switch from
+    /// gap â€” by at most that floor â€” so a healthy stream is never cut short by it. The switch from
     /// the first-byte allowance to the idle gap is never skipped.</para>
     /// </remarks>
     private sealed class UpstreamReadDeadline : IDisposable

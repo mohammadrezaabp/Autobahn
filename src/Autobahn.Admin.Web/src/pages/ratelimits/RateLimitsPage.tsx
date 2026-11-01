@@ -196,9 +196,9 @@ export default function RateLimitsPage() {
     <section class="page" id="panel-ratelimits">
       <header class="page-header">
         <div class="titles">
-          {null}
+          
           <h2>Rate limits</h2>
-          {null}
+          
         </div>
       </header>
 
@@ -270,7 +270,7 @@ export default function RateLimitsPage() {
               <div class="rl-section-head">
                 <div>
                   <h3>Rules</h3>
-                  {null}
+                  
                 </div>
               </div>
 
@@ -383,7 +383,7 @@ export default function RateLimitsPage() {
               <div class="rl-section-head">
                 <div>
                   <h3>Tenant tiers</h3>
-                  {null}
+                  
                 </div>
                 <Show when={store.editable()}>
                   <Button variant="ghost" size="sm" onClick={() => drawers.openTierDrawer('plan')}>

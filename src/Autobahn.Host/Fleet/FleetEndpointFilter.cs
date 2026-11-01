@@ -1,6 +1,8 @@
 using System.Text.Json;
 using Autobahn.Application.Fleet;
 using Autobahn.Domain.Common;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Routing;
 
 namespace Autobahn.Host.Fleet;
 
@@ -15,12 +17,15 @@ public sealed class FleetEndpointFilter(FleetSessionService sessions) : IEndpoin
             var write = !HttpMethods.IsGet(http.Request.Method);
             if (write && http.Request.Headers[FleetSessionService.RequestHeader] != "1")
                 throw new FleetException(400, "request_header_required", "The Autobahn request header is required.");
-            var login = HttpMethods.IsPost(http.Request.Method) && http.Request.Path == "/admin/fleet/api/session";
+            // Only the registered sign-in endpoint carries this server-owned metadata.
+            var endpoint = http.GetEndpoint();
+            var login = endpoint?.Metadata.GetMetadata<IAllowAnonymous>() is not null;
             if (!login)
             {
                 var identity = await sessions.AuthenticateAsync(http, http.RequestAborted);
                 http.Items["FleetActor"] = identity.Actor; http.Items["FleetCanWrite"] = identity.CanWrite; http.Items["FleetExpires"] = identity.ExpiresAt;
-                if (write && !HttpMethods.IsDelete(http.Request.Method) && !identity.CanWrite)
+                var logout = endpoint?.Metadata.GetMetadata<IEndpointNameMetadata>()?.EndpointName == "FleetSessionSignOut";
+                if (write && !logout && !identity.CanWrite)
                     throw new FleetException(403, "read_only", "An operator key is required to change fleet resources.");
             }
             return await next(context);
