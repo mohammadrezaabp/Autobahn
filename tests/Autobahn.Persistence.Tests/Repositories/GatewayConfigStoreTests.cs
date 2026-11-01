@@ -1,0 +1,236 @@
+using Autobahn.Domain.Configuration;
+using Autobahn.Domain.RateLimiting;
+using Autobahn.Persistence.Entities;
+using Autobahn.Persistence.Repositories;
+using Autobahn.Persistence.Tests.Infrastructure;
+
+namespace Autobahn.Persistence.Tests.Repositories;
+
+public sealed class GatewayConfigStoreTests
+{
+    [Fact]
+    public async Task Quota_RowPresent_LoadsScalarsWithDecimalToDoubleConversion()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(
+            nameof(Quota_RowPresent_LoadsScalarsWithDecimalToDoubleConversion));
+
+        db.QuotaSettings.Add(new QuotaSettingsEntity
+        {
+            Id = 1,
+            DefaultMonthlyTokenLimit = 2_500_000,
+            SoftLimitRatio = 0.75m,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        });
+        await db.SaveChangesAsync();
+
+        var snapshot = await new GatewayConfigStore(db).LoadSnapshotAsync();
+
+        snapshot.Quota.DefaultMonthlyTokenLimit.Should().Be(2_500_000);
+        snapshot.Quota.SoftLimitRatio.Should().Be(0.75);
+    }
+
+    [Fact]
+    public async Task Quota_NoRow_FallsBackToDefaults()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(
+            nameof(Quota_NoRow_FallsBackToDefaults));
+
+        var snapshot = await new GatewayConfigStore(db).LoadSnapshotAsync();
+
+        snapshot.Quota.Should().BeSameAs(QuotaConfigSection.Defaults);
+    }
+
+    [Fact]
+    public async Task RateLimits_SaveThenLoad_RoundTripsAndBumpsVersion()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(
+            nameof(RateLimits_SaveThenLoad_RoundTripsAndBumpsVersion));
+
+        await new RateLimitSettingsRepository(db).SaveAsync(
+            enabled: true,
+            adaptiveEnabled: false,
+            new RateLimitPolicy(55, 5, 4),
+            new Dictionary<string, RateLimitPolicy>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["pro"] = new(200, 20, 15),
+            },
+            []);
+
+        var snapshot = await new GatewayConfigStore(db).LoadSnapshotAsync();
+
+        snapshot.RateLimits.Enabled.Should().BeTrue();
+        snapshot.RateLimits.Default.Rpm.Should().Be(55);
+        snapshot.RateLimits.Default.MaxConcurrentStreams.Should().Be(4);
+        snapshot.RateLimits.Plans["PRO"].Rpm.Should().Be(200); // OrdinalIgnoreCase lookup
+        snapshot.Version.Should().Be(1); // save bumped the config version
+    }
+
+    /// <summary>The token limit is stored on the default tier, on a plan and on a scoped rule.</summary>
+    [Fact]
+    public async Task RateLimits_SaveThenLoad_RoundTripsTheTokenLimit()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(
+            nameof(RateLimits_SaveThenLoad_RoundTripsTheTokenLimit));
+
+        await new RateLimitSettingsRepository(db).SaveAsync(
+            enabled: true,
+            adaptiveEnabled: false,
+            new RateLimitPolicy(55, 5, 4) { Tpm = 500_000 },
+            new Dictionary<string, RateLimitPolicy>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["pro"] = new(200, 20, 15) { Tpm = 2_000_000 },
+            },
+            [
+                new RateLimitRuleDefinition(RateLimitScopeNames.Model, "gpt-4", 0, 0, 0) { Tpm = 900_000 },
+                new RateLimitRuleDefinition(RateLimitScopeNames.ApiKey, "key-off", 60, 0, 0) { Tpm = 1000, Enabled = false },
+            ]);
+
+        var rateLimits = (await new GatewayConfigStore(db).LoadSnapshotAsync()).RateLimits;
+
+        rateLimits.Default.Tpm.Should().Be(500_000);
+        rateLimits.Plans["pro"].Tpm.Should().Be(2_000_000);
+        rateLimits.Models["gpt-4"].Should().Be(new RateLimitPolicy(0, 0, 0) { Tpm = 900_000 });
+        rateLimits.ApiKeys.Should().BeEmpty("a switched-off rule enforces nothing");
+        rateLimits.HasTokenLimits().Should().BeTrue();
+    }
+
+    private static Task<long> SaveRateLimitsAsync(Autobahn.Persistence.GatewayDbContext db, int rpm, long? expectedVersion) =>
+        new RateLimitSettingsRepository(db).SaveAsync(
+            enabled: true,
+            adaptiveEnabled: false,
+            new RateLimitPolicy(rpm, 0, 0),
+            new Dictionary<string, RateLimitPolicy>(StringComparer.OrdinalIgnoreCase),
+            [],
+            expectedVersion);
+
+    /// <summary>
+    /// Rate limits shared the general version row with CORS, so a CORS save made a pending rate-limit
+    /// write look stale although nobody had touched a rule. They have their own row now; the general
+    /// one still moves on every write because it is the reload signal the other instances poll.
+    /// </summary>
+    [Fact]
+    public async Task RateLimits_SaveAfterAnUnrelatedCorsSave_IsNotAConflict()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(
+            nameof(RateLimits_SaveAfterAnUnrelatedCorsSave_IsNotAConflict));
+
+        var read = await SaveRateLimitsAsync(db, 50, expectedVersion: null);
+        await new CorsSettingsRepository(db).SaveAllowedOriginsAsync(["https://console.example"]);
+
+        var written = await SaveRateLimitsAsync(db, 60, expectedVersion: read);
+
+        written.Should().Be(read + 1);
+        var snapshot = await new GatewayConfigStore(db).LoadSnapshotAsync();
+        snapshot.RateLimits.Default.Rpm.Should().Be(60);
+        snapshot.RateLimits.Version.Should().Be(written, "the ETag is the rate-limit version, not the general one");
+        snapshot.Version.Should().Be(3, "two rate-limit writes and one CORS write each moved the reload signal");
+    }
+
+    [Fact]
+    public async Task RateLimits_SaveBasedOnAStaleRateLimitVersion_IsRefusedAndWritesNothing()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(
+            nameof(RateLimits_SaveBasedOnAStaleRateLimitVersion_IsRefusedAndWritesNothing));
+
+        var read = await SaveRateLimitsAsync(db, 50, expectedVersion: null);
+        await SaveRateLimitsAsync(db, 60, expectedVersion: read);
+
+        var stale = () => SaveRateLimitsAsync(db, 70, expectedVersion: read);
+
+        (await stale.Should().ThrowAsync<RateLimitVersionConflictException>())
+            .Which.ActualVersion.Should().Be(read + 1);
+        db.ChangeTracker.Clear();
+        var snapshot = await new GatewayConfigStore(db).LoadSnapshotAsync();
+        snapshot.RateLimits.Default.Rpm.Should().Be(60);
+        snapshot.RateLimits.Version.Should().Be(read + 1);
+    }
+
+    /// <summary>The anonymous tier is one <c>anonymous</c>/<c>*</c> row, loaded like the auth-failure one.</summary>
+    [Fact]
+    public async Task RateLimits_AnonymousRule_LoadsIntoTheAnonymousTier()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(
+            nameof(RateLimits_AnonymousRule_LoadsIntoTheAnonymousTier));
+
+        await new RateLimitSettingsRepository(db).SaveAsync(
+            enabled: true,
+            adaptiveEnabled: false,
+            new RateLimitPolicy(3000, 500, 256),
+            new Dictionary<string, RateLimitPolicy>(StringComparer.OrdinalIgnoreCase),
+            [new RateLimitRuleDefinition(RateLimitScopeNames.Anonymous, RateLimitScopeNames.SingletonTarget, 60, 20, 2)]);
+
+        var snapshot = await new GatewayConfigStore(db).LoadSnapshotAsync();
+
+        snapshot.RateLimits.Anonymous.Should().Be(new RateLimitPolicy(60, 20, 2));
+    }
+
+    /// <summary>No row means "use the default tier", which is what deployments predating the tier get.</summary>
+    [Fact]
+    public async Task RateLimits_WithNoAnonymousRule_LeavesTheAnonymousTierUnlimited()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(
+            nameof(RateLimits_WithNoAnonymousRule_LeavesTheAnonymousTierUnlimited));
+
+        await new RateLimitSettingsRepository(db).SaveAsync(
+            enabled: true,
+            adaptiveEnabled: false,
+            new RateLimitPolicy(3000, 500, 256),
+            new Dictionary<string, RateLimitPolicy>(StringComparer.OrdinalIgnoreCase),
+            []);
+
+        var snapshot = await new GatewayConfigStore(db).LoadSnapshotAsync();
+
+        snapshot.RateLimits.Anonymous.Should().Be(RateLimitPolicy.Unlimited);
+    }
+
+    [Fact]
+    public async Task RateLimits_SaveDisabled_RoundTripsFlagAndKeepsTierValues()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(
+            nameof(RateLimits_SaveDisabled_RoundTripsFlagAndKeepsTierValues));
+
+        await new RateLimitSettingsRepository(db).SaveAsync(
+            enabled: false,
+            adaptiveEnabled: false,
+            new RateLimitPolicy(55, 5, 4),
+            new Dictionary<string, RateLimitPolicy>(StringComparer.OrdinalIgnoreCase),
+            []);
+
+        var snapshot = await new GatewayConfigStore(db).LoadSnapshotAsync();
+
+        snapshot.RateLimits.Enabled.Should().BeFalse();
+        // Tier values survive a disable so re-enabling restores the configured limits.
+        snapshot.RateLimits.Default.Rpm.Should().Be(55);
+        snapshot.RateLimits.Default.MaxConcurrentStreams.Should().Be(4);
+    }
+
+    [Fact]
+    public async Task RateLimits_WithNoDefaultsRow_DefaultsToEnabled()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(
+            nameof(RateLimits_WithNoDefaultsRow_DefaultsToEnabled));
+
+        var snapshot = await new GatewayConfigStore(db).LoadSnapshotAsync();
+
+        // A database-less / pre-seed gateway must enforce, never silently allow everything.
+        snapshot.RateLimits.Enabled.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Version_StartsAtZero_ThenIncrementsMonotonically()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(
+            nameof(Version_StartsAtZero_ThenIncrementsMonotonically));
+        var sut = new GatewayConfigStore(db);
+
+        (await sut.GetVersionAsync()).Should().Be(0);
+
+        (await sut.IncrementVersionAsync()).Should().Be(1);
+        (await sut.IncrementVersionAsync()).Should().Be(2);
+
+        (await sut.GetVersionAsync()).Should().Be(2);
+
+        var snapshot = await sut.LoadSnapshotAsync();
+        snapshot.Version.Should().Be(2);
+    }
+}

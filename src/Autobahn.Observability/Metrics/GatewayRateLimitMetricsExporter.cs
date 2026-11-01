@@ -1,0 +1,143 @@
+using System.Diagnostics.Metrics;
+using Microsoft.Extensions.Hosting;
+using Autobahn.Application.Abstractions;
+
+namespace Autobahn.Observability.Metrics;
+
+/// <summary>
+/// Publishes what rate limiting is currently doing: the adaptive factor in force per model, and how
+/// full the partition tables are.
+/// </summary>
+/// <remarks>
+/// <para>Observable gauges rather than counters, because both are states rather than events. They
+/// are read at scrape time, so an idle gateway costs nothing and a busy one pays once per scrape
+/// rather than once per request.</para>
+///
+/// <para>Model is the only label used here. It is bounded by the registry, whereas tenant and — far
+/// worse — the anonymous partition key are not: a per-partition gauge would mint one time series per
+/// client address block, which is how a metrics backend is taken down. Per-tenant and per-key
+/// numbers live in the usage report instead, where the key set is explicitly bounded.</para>
+/// </remarks>
+public sealed class GatewayRateLimitMetricsExporter(
+    IAdaptiveRateLimitGovernor? governor = null,
+    IDistributedRateLimitStore? store = null,
+    IRateLimitUsageTracker? usage = null,
+    TimeProvider? timeProvider = null) : IHostedService
+{
+    /// <summary>Complete minutes the utilization ratio is averaged over.</summary>
+    public const int UtilizationWindowMinutes = 5;
+
+    private readonly TimeProvider _timeProvider = timeProvider ?? TimeProvider.System;
+
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        GatewayMeters.Meter.CreateObservableGauge(
+            "gateway_rate_limit_adaptive_factor",
+            ObserveAdaptiveFactors,
+            description: "Multiplier applied to a model's configured rate limit (1 = enforced as configured)");
+
+        GatewayMeters.Meter.CreateObservableGauge(
+            "gateway_rate_limit_partitions",
+            ObservePartitions,
+            description: "Live rate-limit partitions per dimension against the configured ceiling");
+
+        // A counter, not a gauge: it only ever rises, and what an alert wants is the rate of change —
+        // "are limits being reset right now", not "have they ever been".
+        GatewayMeters.Meter.CreateObservableCounter(
+            "gateway_rate_limit_forced_evictions_total",
+            ObserveForcedEvictions,
+            description: "Partitions evicted with budget still spent, each of which starts full again "
+                + "on its next request; a non-zero rate means limits are not being fully enforced");
+
+        GatewayMeters.Meter.CreateObservableGauge(
+            "gateway_rate_limit_backed_off_partitions",
+            ObserveBackoff,
+            description: "Partitions currently being told to wait longer than their bucket alone would say");
+
+        // limit_id is bounded the way the usage report is: the tracker holds at most
+        // RateLimiting:UsageReportMaxKeys limits and exports only the ones that drain one bucket.
+        GatewayMeters.Meter.CreateObservableGauge(
+            "gateway_rate_limit_utilization_ratio",
+            ObserveUtilization,
+            description: "Tokens kept per minute over the rate enforced, per limit that drains one "
+                + "bucket, averaged over the last 5 complete minutes");
+
+        return Task.CompletedTask;
+    }
+
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+    private IEnumerable<Measurement<double>> ObserveUtilization()
+    {
+        if (usage is null)
+        {
+            yield break;
+        }
+
+        foreach (var limit in usage.ReadLimitUtilization(UtilizationWindowMinutes, _timeProvider.GetUtcNow()))
+        {
+            yield return new Measurement<double>(
+                limit.Ratio,
+                new KeyValuePair<string, object?>("limit_id", limit.LimitId));
+        }
+    }
+
+    private IEnumerable<Measurement<double>> ObserveAdaptiveFactors()
+    {
+        var snapshot = governor?.Snapshot();
+        if (snapshot is null || !snapshot.Enabled)
+        {
+            yield break;
+        }
+
+        foreach (var model in snapshot.Models)
+        {
+            yield return new Measurement<double>(
+                model.Factor,
+                new KeyValuePair<string, object?>("model", model.ModelId));
+        }
+    }
+
+    private IEnumerable<Measurement<int>> ObservePartitions()
+    {
+        if (store is null)
+        {
+            yield break;
+        }
+
+        var stats = store.GetStats();
+        yield return new Measurement<int>(
+            stats.RequestPartitions,
+            new KeyValuePair<string, object?>("dimension", "request"));
+        yield return new Measurement<int>(
+            stats.StreamPartitions,
+            new KeyValuePair<string, object?>("dimension", "stream"));
+
+        // The ceiling as its own series so an alert can be written on the ratio without the
+        // threshold being duplicated into the alert rule, where it would drift from the config.
+        yield return new Measurement<int>(
+            stats.MaxPartitions,
+            new KeyValuePair<string, object?>("dimension", "ceiling"));
+    }
+
+    private IEnumerable<Measurement<long>> ObserveForcedEvictions()
+    {
+        if (store is null)
+        {
+            yield break;
+        }
+
+        yield return new Measurement<long>(store.GetStats().ForcedEvictions);
+    }
+
+    private IEnumerable<Measurement<int>> ObserveBackoff()
+    {
+        var snapshot = governor?.Snapshot();
+        if (snapshot is null || !snapshot.Enabled)
+        {
+            yield break;
+        }
+
+        yield return new Measurement<int>(snapshot.BackedOffPartitions);
+    }
+}

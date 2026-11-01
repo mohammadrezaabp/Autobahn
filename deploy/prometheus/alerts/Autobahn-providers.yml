@@ -1,0 +1,127 @@
+# Alerts on the paid providers the gateway holds a company key for (OpenRouter, OpenAI, DeepSeek, …).
+# They select the provider series, which exist only once a provider has a key or has been spent
+# at, so on a gateway with no paid provider none of them can fire.
+groups:
+  - name: Autobahn-providers
+    rules:
+      # The level is the one an operator set on Providers › Settings. No level, no series on the
+      # right-hand side, no alert.
+      - alert: GatewayProviderCreditLow
+        expr: >-
+          gateway_provider_credit_remaining
+            < on (provider) group_left ()
+          gateway_provider_credit_low_threshold
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.provider }} credit is low: {{ $value | printf "%.2f" }} {{ $labels.currency }} left'
+          description: >-
+            The remaining {{ $labels.provider }} credit has been below the alert level for 10
+            minutes. When it reaches zero every caller of a {{ $labels.provider }} model is refused
+            at once. Top up the account, or lower the tenants' monthly caps.
+          runbook: docs/runbooks/providers.md#credit-low
+
+      # 402 is an answer, so the circuit breaker does not count it and the model stays "healthy"
+      # while every request to it fails. This is the only place an empty account shows.
+      - alert: GatewayProviderCreditExhausted
+        expr: >-
+          sum by (provider) (increase(gateway_provider_account_refusals_total{upstream_status="402"}[10m])) > 0
+          or
+          (
+            sum by (provider) (gateway_provider_account_refusals_total{upstream_status="402"}) > 0
+            unless
+            sum by (provider) (gateway_provider_account_refusals_total{upstream_status="402"} offset 10m)
+          )
+        labels:
+          severity: critical
+        annotations:
+          summary: '{{ $labels.provider }} is refusing requests: the account is out of credit'
+          description: >-
+            {{ $labels.provider }} answered 402 (payment required) in the last 10 minutes. Requests
+            to its models fail for every key until the account is topped up.
+          runbook: docs/runbooks/providers.md#credit-exhausted
+
+      # The same shape for a key the provider no longer accepts: revoked, mistyped or expired.
+      - alert: GatewayProviderKeyRejected
+        expr: >-
+          sum by (provider) (increase(gateway_provider_account_refusals_total{upstream_status="401"}[10m])) > 0
+          or
+          (
+            sum by (provider) (gateway_provider_account_refusals_total{upstream_status="401"}) > 0
+            unless
+            sum by (provider) (gateway_provider_account_refusals_total{upstream_status="401"} offset 10m)
+          )
+        labels:
+          severity: critical
+        annotations:
+          summary: '{{ $labels.provider }} is rejecting the company key'
+          description: >-
+            {{ $labels.provider }} answered 401 in the last 10 minutes: the key the gateway holds is
+            revoked, expired or wrong. Replace it on Providers › Settings.
+          runbook: docs/runbooks/providers.md#key-rejected
+
+      # The last 24 hours against the daily average of the week before them. The floor keeps a
+      # provider that is barely used from alerting on its first real day.
+      - alert: GatewayProviderSpendSpike
+        expr: >-
+          sum by (provider) (increase(gateway_provider_spend_dollars_total[1d]))
+            > 3 * sum by (provider) (increase(gateway_provider_spend_dollars_total[7d] offset 1d)) / 7
+          and
+          sum by (provider) (increase(gateway_provider_spend_dollars_total[1d])) > 5
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.provider }} spend is {{ $value | printf "%.2f" }} USD in 24 hours, over three times the recent daily average'
+          description: >-
+            Spend at {{ $labels.provider }} in the last 24 hours is more than three times the daily
+            average of the seven days before. Providers › Spend shows which tenant, key and model
+            it came from.
+          runbook: docs/runbooks/providers.md#spend-spike
+
+      - alert: GatewayProviderTenantNearCap
+        expr: gateway_provider_tenant_cap_used_ratio >= 0.8
+        for: 5m
+        labels:
+          severity: warning
+          team: '{{ $labels.tenant }}'
+        annotations:
+          summary: '{{ $labels.tenant }} has used {{ $value | humanizePercentage }} of its {{ $labels.provider }} cap'
+          description: >-
+            Tenant {{ $labels.tenant }} has spent at least 80% of its monthly {{ $labels.provider }}
+            cap. At 100% its keys are refused with spend_cap_reached until the month ends or an
+            operator raises the cap.
+          runbook: docs/runbooks/providers.md#tenant-near-cap
+
+      # The fall of the provider's balance this month against what the gateway charged over the same
+      # time. The threshold (a share and a dollar floor) is the gateway's own setting, so the rule
+      # only has to read the flag. An hour, because a top-up or a slow usage writer moves it briefly.
+      - alert: GatewayProviderSpendDrift
+        expr: gateway_provider_spend_drifting == 1
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.provider }} spend and the gateway''s charges disagree this month'
+          description: >-
+            The {{ $labels.provider }} balance fell by more than the gateway charged for its
+            requests there, or by less, past the drift threshold, for an hour. A model's rate
+            card may be wrong, or another client is spending on the same account. Providers ›
+            {{ $labels.provider }} › Spend shows the comparison by day.
+          runbook: docs/runbooks/providers.md#spend-drift
+
+      # Until the first successful read the series holds the gateway's start time, so a provider
+      # that has never answered alerts too.
+      - alert: GatewayProviderBalanceUnknown
+        expr: time() - gateway_provider_credit_last_read_timestamp_seconds > 1800
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'The {{ $labels.provider }} balance has not been read for 30 minutes'
+          description: >-
+            The gateway could not read the {{ $labels.provider }} credit for 30 minutes, so the
+            low-credit alert is blind. The provider is unreachable from the gateway, or is refusing
+            the key. Providers › {{ $labels.provider }} shows the last error.
+          runbook: docs/runbooks/providers.md#balance-unknown

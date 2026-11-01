@@ -1,0 +1,217 @@
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Autobahn.Application.Abstractions;
+using Autobahn.Domain.Configuration;
+using Autobahn.OperatorConsole.Commands;
+using Spectre.Console;
+
+namespace Autobahn.OperatorConsole.Hosting;
+
+public sealed class OperatorConsoleHostedService(
+    IControlPlaneCommands commands,
+    IServiceProvider services,
+    IOptions<OperatorConsoleOptions> options,
+    ILogger<OperatorConsoleHostedService> logger) : BackgroundService
+{
+    private readonly ModelRegistryConsoleInteractor _registryConsole = new(commands);
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        if (!options.Value.Enabled)
+        {
+            return;
+        }
+
+        if (Console.IsInputRedirected)
+        {
+            logger.LogInformation("Operator console disabled: stdin is redirected.");
+            return;
+        }
+
+        // BackgroundService.StartAsync runs ExecuteAsync inline until its first incomplete await.
+        // Hosted services start sequentially and Kestrel is registered last, so a blocking console
+        // read here would keep the server from listening until the operator pressed Enter. Yield
+        // first so StartAsync returns immediately and the prompt loop runs on the thread pool.
+        await Task.Yield();
+
+        AnsiConsole.MarkupLine("[grey]Autobahn operator console — type 'help' for commands.[/]");
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            string line;
+            try
+            {
+                line = await AnsiConsole.AskAsync<string>("[green]Autobahn>[/]", stoppingToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+
+            var intent = ConsoleCommandParser.Parse(line);
+            if (intent.Kind == ConsoleCommandKind.Exit)
+            {
+                break;
+            }
+
+            try
+            {
+                await ExecuteIntentAsync(intent, stoppingToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Operator command failed.");
+                AnsiConsole.MarkupLine($"[red]Error: {Markup.Escape(ex.Message)}[/]");
+            }
+        }
+    }
+
+    private async Task ExecuteIntentAsync(ConsoleCommandIntent intent, CancellationToken cancellationToken)
+    {
+        switch (intent.Kind)
+        {
+            case ConsoleCommandKind.Help:
+                AnsiConsole.MarkupLine(
+                    "[yellow]Commands:[/] help, exit, status, summary, watch summary, backends, " +
+                    "requests [--limit N], reload, keys list, models list|add|edit <id>|remove <id>");
+                break;
+            case ConsoleCommandKind.Status:
+            case ConsoleCommandKind.Summary:
+                RenderSummary(commands.GetSummary());
+                break;
+            case ConsoleCommandKind.WatchSummary:
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    AnsiConsole.Clear();
+                    RenderSummary(commands.GetSummary());
+                    await Task.Delay(options.Value.RefreshIntervalMs, cancellationToken).ConfigureAwait(false);
+                }
+
+                break;
+            case ConsoleCommandKind.Backends:
+                RenderBackends(commands.ListBackends());
+                break;
+            case ConsoleCommandKind.Requests:
+                RenderRequests(commands.ListRecentRequests(intent.Limit));
+                break;
+            case ConsoleCommandKind.Reload:
+                var reload = await commands.ReloadConfigAsync(cancellationToken).ConfigureAwait(false);
+                AnsiConsole.MarkupLine($"[cyan]Reload:[/] {Markup.Escape(reload.Status)}");
+                break;
+            case ConsoleCommandKind.KeysList:
+                {
+                    // IAdminKeyService / ITenantRepository are scoped (they own a DbContext); resolving
+                    // them from the root provider throws under scope validation and leaks otherwise.
+                    await using var scope = services.CreateAsyncScope();
+                    await CreateKeysInteractor(scope.ServiceProvider).ListKeysAsync(cancellationToken).ConfigureAwait(false);
+                    break;
+                }
+            case ConsoleCommandKind.ModelsList:
+                RenderModels(commands.ListModels());
+                break;
+            case ConsoleCommandKind.ModelsAdd:
+                await _registryConsole.AddModelAsync(cancellationToken).ConfigureAwait(false);
+                break;
+            case ConsoleCommandKind.ModelsEdit:
+                if (string.IsNullOrWhiteSpace(intent.ModelId))
+                {
+                    AnsiConsole.MarkupLine("[red]Usage: models edit <id>[/]");
+                    break;
+                }
+
+                await _registryConsole.EditModelAsync(intent.ModelId, cancellationToken).ConfigureAwait(false);
+                break;
+            case ConsoleCommandKind.ModelsRemove:
+                if (string.IsNullOrWhiteSpace(intent.ModelId))
+                {
+                    AnsiConsole.MarkupLine("[red]Usage: models remove <id>[/]");
+                    break;
+                }
+
+                await _registryConsole.RemoveModelAsync(intent.ModelId, cancellationToken).ConfigureAwait(false);
+                break;
+            default:
+                AnsiConsole.MarkupLine("[red]Unknown command.[/] Type 'help'.");
+                break;
+        }
+    }
+
+    private OperatorConsoleKeysInteractor CreateKeysInteractor(IServiceProvider scopedServices) =>
+        new(
+            scopedServices.GetRequiredService<IAdminKeyService>(),
+            scopedServices.GetRequiredService<ITenantRepository>(),
+            options);
+
+    private static void RenderSummary(Autobahn.Domain.Models.AdminSummarySnapshot summary)
+    {
+        AnsiConsole.Write(BuildSummaryTable(summary));
+    }
+
+    private static Table BuildSummaryTable(Autobahn.Domain.Models.AdminSummarySnapshot summary)
+    {
+        var table = new Table().Title("Gateway summary");
+        table.AddColumn("Metric");
+        table.AddColumn("Value");
+        table.AddRow("Uptime", summary.Uptime);
+        table.AddRow("Total requests", summary.TotalInferenceRequests.ToString());
+        table.AddRow("Errors", summary.TotalErrors.ToString());
+        table.AddRow("Avg latency (ms)", summary.AverageLatencyMs.ToString("F1"));
+        table.AddRow("Active streams", summary.ActiveStreams.ToString());
+        table.AddRow("Rate limit rejections", summary.RateLimitRejections.ToString());
+        table.AddRow("Quota rejections", summary.QuotaRejections.ToString());
+        return table;
+    }
+
+    private static void RenderModels(IReadOnlyList<Autobahn.Domain.Models.ModelConfig> models)
+    {
+        var table = new Table().Title("Models");
+        table.AddColumn("Id");
+        table.AddColumn("URL");
+        table.AddColumn("Aliases");
+        foreach (var model in models)
+        {
+            table.AddRow(
+                model.Id,
+                model.Url,
+                model.Aliases.Count > 0 ? string.Join(", ", model.Aliases) : "-");
+        }
+
+        AnsiConsole.Write(table);
+    }
+
+    private static void RenderBackends(IReadOnlyList<Autobahn.Domain.Models.BackendAdminDto> backends)
+    {
+        var table = new Table().Title("Backends");
+        table.AddColumn("Model");
+        table.AddColumn("URL");
+        table.AddColumn("Healthy");
+        foreach (var backend in backends)
+        {
+            table.AddRow(backend.ModelId, backend.Url, backend.IsHealthy ? "yes" : "no");
+        }
+
+        AnsiConsole.Write(table);
+    }
+
+    private static void RenderRequests(IReadOnlyList<Autobahn.Domain.Models.RecentRequestEntry> requests)
+    {
+        var table = new Table().Title("Recent requests");
+        table.AddColumn("Time");
+        table.AddColumn("Model");
+        table.AddColumn("Status");
+        table.AddColumn("Error");
+        table.AddColumn("Duration");
+        foreach (var request in requests)
+        {
+            table.AddRow(
+                request.TimestampUtc.ToString("O"),
+                request.ModelId ?? "-",
+                request.StatusCode.ToString(),
+                request.ErrorCode ?? "-",
+                $"{request.DurationMs:F0}ms");
+        }
+
+        AnsiConsole.Write(table);
+    }
+}

@@ -1,0 +1,231 @@
+using System.Collections.Concurrent;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using Autobahn.Application.Abstractions;
+using Autobahn.Domain.Configuration;
+using Autobahn.Domain.Models;
+using Autobahn.Policy.CircuitBreaker;
+
+namespace Autobahn.Proxy.Resilience;
+
+/// <summary>
+/// One circuit breaker per backend. The <c>modelId</c> every member takes is the backend's key
+/// (<see cref="ModelBackends.Key"/>), which for a model with a single backend is the model id.
+/// </summary>
+public sealed class ModelCircuitBreakerRegistry : ICircuitBreakerStateSource
+{
+    private readonly ConcurrentDictionary<string, CircuitBreaker> _breakers = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _lastTransition = new(StringComparer.Ordinal);
+    private readonly CircuitBreakerPolicyOptions _policyOptions;
+    private readonly int _maxTrackedModels;
+    private readonly IGatewayMetricsCollector _metrics;
+    private readonly ILogger<ModelCircuitBreakerRegistry> _logger;
+
+    public ModelCircuitBreakerRegistry(
+        IOptions<GatewayOptions> options,
+        IGatewayMetricsCollector metrics,
+        ILogger<ModelCircuitBreakerRegistry>? logger = null)
+    {
+        _policyOptions = CircuitBreakerPolicyOptions.FromGatewayResilience(options.Value.Resilience);
+        _maxTrackedModels = options.Value.Resilience.MaxTrackedResilienceModels;
+        _metrics = metrics;
+        _logger = logger ?? NullLogger<ModelCircuitBreakerRegistry>.Instance;
+        _overflowBreaker = new CircuitBreaker(_policyOptions);
+    }
+
+    /// <summary>
+    /// Shared breaker used once the per-model registry is at its cardinality limit.
+    /// </summary>
+    /// <remarks>
+    /// Overflow used to return a brand-new breaker on every call. Since every operation —
+    /// <see cref="TryEnter"/>, <see cref="RecordSuccess"/>, <see cref="RecordFailure"/> — goes
+    /// through <see cref="GetBreaker"/>, each got its own instance: admission always succeeded and
+    /// recorded failures mutated an object that was garbage before the next request. Past the limit
+    /// the breaker silently stopped protecting anything at all. A single shared instance keeps the
+    /// cardinality bound while still tripping, degrading to coarser granularity rather than to off.
+    /// </remarks>
+    private readonly CircuitBreaker _overflowBreaker;
+
+    public CircuitBreaker GetBreaker(string modelId)
+    {
+        if (_breakers.TryGetValue(modelId, out var existing))
+        {
+            return existing;
+        }
+
+        if (_breakers.Count >= _maxTrackedModels)
+        {
+            if (_overflowWarned.TrySet())
+            {
+                _logger.LogWarning(
+                    "Circuit-breaker registry reached its limit of {MaxTrackedModels} models; further models "
+                    + "share one breaker. Raise Gateway:Resilience:MaxTrackedResilienceModels if this is a "
+                    + "legitimately large registry.",
+                    _maxTrackedModels);
+            }
+
+            return _overflowBreaker;
+        }
+
+        return _breakers.GetOrAdd(modelId, static (_, policy) => new CircuitBreaker(policy), _policyOptions);
+    }
+
+    /// <summary>
+    /// Removes tracking for a model that no longer exists, so live registry churn cannot walk the
+    /// dictionary up to its cardinality limit and force every model into the shared overflow breaker.
+    /// </summary>
+    public void Forget(string modelId)
+    {
+        _breakers.TryRemove(modelId, out _);
+        _lastTransition.TryRemove(modelId, out _);
+    }
+
+    /// <summary>Drops tracking for every model outside <paramref name="knownModelIds"/>.</summary>
+    public void RetainOnly(IReadOnlySet<string> knownModelIds)
+    {
+        foreach (var key in _breakers.Keys)
+        {
+            if (!knownModelIds.Contains(key))
+            {
+                _breakers.TryRemove(key, out _);
+                _lastTransition.TryRemove(key, out _);
+            }
+        }
+    }
+
+    private readonly OnceFlag _overflowWarned = new();
+
+    private sealed class OnceFlag
+    {
+        private int _set;
+
+        public bool TrySet() => Interlocked.Exchange(ref _set, 1) == 0;
+    }
+
+    public bool TryEnter(string modelId)
+    {
+        var breaker = GetBreaker(modelId);
+        var before = breaker.State;
+        var entered = breaker.TryEnter();
+
+        // Admission granted while the breaker was *already* half-open means the previous probe's
+        // permit was reclaimed: it had not reported an outcome within the probe timeout. A normal
+        // Open -> HalfOpen promotion enters this method with `before == Open`, so it never lands
+        // here. Worth a line, because the condition it reports — a probe running far longer than
+        // the breaker expects — is otherwise invisible and is usually the real story.
+        if (entered && before == CircuitState.HalfOpen)
+        {
+            _logger.LogWarning(
+                "Circuit breaker for model {ModelId}: half-open probe did not report an outcome within "
+                + "{HalfOpenProbeTimeoutSeconds}s and its permit was reclaimed for a new probe. Requests "
+                + "for this model were refused while it ran; if probes routinely take this long, raise "
+                + "Gateway:Resilience:CircuitBreakerHalfOpenProbeTimeoutSeconds.",
+                ModelBackends.Display(modelId),
+                _policyOptions.HalfOpenProbeTimeout.TotalSeconds);
+        }
+
+        NotifyStateChange(modelId, before, breaker.State);
+        return entered;
+    }
+
+    /// <param name="caller">Who sent the request; see <see cref="CircuitBreaker.RecordFailure"/>.</param>
+    public void RecordSuccess(string modelId, string? caller = null)
+    {
+        var breaker = GetBreaker(modelId);
+        var before = breaker.State;
+        breaker.RecordSuccess(caller);
+        NotifyStateChange(modelId, before, breaker.State);
+    }
+
+    /// <inheritdoc cref="RecordSuccess"/>
+    public void RecordFailure(string modelId, string? caller = null)
+    {
+        var breaker = GetBreaker(modelId);
+        var before = breaker.State;
+        breaker.RecordFailure(caller);
+        NotifyStateChange(modelId, before, breaker.State);
+    }
+
+    /// <summary>
+    /// Releases a half-open probe permit without recording an outcome. Call this when a request that
+    /// passed <see cref="TryEnter"/> ends for a reason unrelated to backend health.
+    /// </summary>
+    public void RecordAbandoned(string modelId)
+    {
+        var breaker = GetBreaker(modelId);
+        var before = breaker.State;
+        breaker.RecordAbandoned();
+        NotifyStateChange(modelId, before, breaker.State);
+    }
+
+    public IReadOnlyList<CircuitBreakerModelState> GetStates()
+    {
+        var list = new List<CircuitBreakerModelState>(_breakers.Count);
+        foreach (var pair in _breakers)
+        {
+            var snapshot = pair.Value.GetSnapshot();
+            var (modelId, backendName) = ModelBackends.SplitKey(pair.Key);
+            list.Add(new CircuitBreakerModelState(
+                modelId,
+                ToMetricState(snapshot.State),
+                snapshot.OpenedAt,
+                snapshot.FailuresInWindow,
+                snapshot.OutcomesInWindow,
+                _lastTransition.TryGetValue(pair.Key, out var at) ? at : null,
+                backendName));
+        }
+
+        return list;
+    }
+
+    private void NotifyStateChange(string modelId, CircuitState before, CircuitState after)
+    {
+        if (before == after)
+        {
+            return;
+        }
+
+        _lastTransition[modelId] = DateTimeOffset.UtcNow;
+        _metrics.RecordCircuitBreakerTransition(ModelBackends.SplitKey(modelId).ModelId, ToStateLabel(after));
+
+        // From here on the key is only read by people.
+        modelId = ModelBackends.Display(modelId);
+
+        if (after == CircuitState.Open)
+        {
+            _logger.LogWarning(
+                "Circuit breaker opened for model {ModelId} after at least {FailureThreshold} backend failures in its sampling window; " +
+                "rejecting requests for {BreakDurationSeconds}s",
+                modelId,
+                _policyOptions.FailureThreshold,
+                _policyOptions.BreakDuration.TotalSeconds);
+        }
+        else
+        {
+            _logger.LogInformation(
+                "Circuit breaker for model {ModelId} transitioned {FromState} -> {ToState}",
+                modelId,
+                ToStateLabel(before),
+                ToStateLabel(after));
+        }
+    }
+
+    internal static int ToMetricState(CircuitState state) =>
+        state switch
+        {
+            CircuitState.Closed => 0,
+            CircuitState.HalfOpen => 1,
+            CircuitState.Open => 2,
+            _ => 0,
+        };
+
+    internal static string ToStateLabel(CircuitState state) =>
+        state switch
+        {
+            CircuitState.Closed => "closed",
+            CircuitState.HalfOpen => "half_open",
+            CircuitState.Open => "open",
+            _ => "unknown",
+        };
+}

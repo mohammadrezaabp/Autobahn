@@ -1,0 +1,1 @@
+{"error":{"message":"The tenant is not opened for this model\u0027s provider.","type":"permission_error","code":"provider_closed_for_tenant","param":"model"}}

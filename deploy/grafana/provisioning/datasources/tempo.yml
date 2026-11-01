@@ -1,0 +1,11 @@
+apiVersion: 1
+
+# Request traces, kept by the compose `tracing` profile. Without that profile nothing answers
+# here and the datasource shows as unreachable; the dashboards do not use it.
+datasources:
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false

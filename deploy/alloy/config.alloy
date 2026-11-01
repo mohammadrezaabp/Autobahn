@@ -1,0 +1,94 @@
+// Ships the output of every container in the Autobahn compose project to Loki.
+//
+// Containers are found and read through the Docker API, so nothing in the gateway changes and
+// `docker logs` keeps working. Read positions are kept on the alloy-data volume: after a restart,
+// or while Loki is down, shipping resumes where it stopped for as long as Docker still holds the
+// lines (see the logging caps in docker-compose.yml).
+
+logging {
+  level = "warn"
+}
+
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "15s"
+
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=Autobahn"]
+  }
+}
+
+// Two labels only. Every distinct label value is a separate stream in Loki, so request ids,
+// tenants and models stay in the line and are found by searching.
+discovery.relabel "containers" {
+  targets = []
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.containers.targets
+  relabel_rules = discovery.relabel.containers.rules
+  forward_to    = [loki.process.logs.receiver]
+}
+
+loki.process "logs" {
+  forward_to = [loki.write.loki.receiver]
+
+  // The gateway writes Serilog's console format: "[14:03:22 INF] message", with an exception's
+  // stack trace on the lines after it.
+  stage.match {
+    selector = "{service=\"gateway\"}"
+
+    // Keep a stack trace with the line that reported it.
+    stage.multiline {
+      firstline     = `^\[\d{2}:\d{2}:\d{2} [A-Z]{3}\]`
+      max_wait_time = "3s"
+      max_lines     = 500
+    }
+
+    stage.regex {
+      expression = `^\[\d{2}:\d{2}:\d{2} (?P<level>[A-Z]{3})\]`
+    }
+
+    // Serilog's three-letter codes, as the names Grafana colours.
+    stage.template {
+      source   = "level"
+      template = `{{ if eq .Value "VRB" }}trace{{ else if eq .Value "DBG" }}debug{{ else if eq .Value "INF" }}info{{ else if eq .Value "WRN" }}warn{{ else if eq .Value "ERR" }}error{{ else if eq .Value "FTL" }}fatal{{ else }}{{ .Value }}{{ end }}`
+    }
+
+    stage.labels {
+      values = { level = "" }
+    }
+  }
+
+  // These write logfmt with a level= field. Anything else (the mock upstream) is shipped as it is.
+  stage.match {
+    selector = "{service=~\"prometheus|alertmanager|grafana|loki|alloy\"}"
+
+    stage.logfmt {
+      mapping = { level = "" }
+    }
+
+    stage.labels {
+      values = { level = "" }
+    }
+  }
+}
+
+loki.write "loki" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

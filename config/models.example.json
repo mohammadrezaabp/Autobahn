@@ -1,0 +1,13 @@
+{
+  "models": [
+    {
+      "id": "local-chat",
+      "url": "http://localhost:8000",
+      "publicAccess": false,
+      "capabilities": [
+        "chat",
+        "completions"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1916 @@
+using System.Text;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using Autobahn.Proxy.Resilience;
+using NSubstitute;
+using Autobahn.Application.Abstractions;
+using Autobahn.Domain.Configuration;
+using Autobahn.Application.Errors;
+using Autobahn.Application.Forwarding;
+using Autobahn.Domain.Identity;
+using Autobahn.Domain.Models;
+using Autobahn.Application.Observability;
+using Autobahn.Application.Security;
+using System.Security.Claims;
+using Autobahn.Domain.RateLimiting;
+using Autobahn.Policy.CircuitBreaker;
+using Autobahn.Registry.Health;
+using Autobahn.Proxy.Forwarding;
+using Autobahn.Proxy.Middleware;
+using Yarp.ReverseProxy.Forwarder;
+
+namespace Autobahn.Proxy.Tests.Middleware;
+
+public sealed class ModelRouterMiddlewareTests
+{
+    [Fact]
+    public async Task InvokeAsync_PassthroughPath_CallsNext()
+    {
+        var nextCalled = false;
+        var middleware = CreateMiddleware(_ =>
+        {
+            nextCalled = true;
+            return Task.CompletedTask;
+        });
+
+        var context = CreateContext(HttpMethods.Get, "/health/live");
+
+        await middleware.InvokeAsync(context);
+
+        nextCalled.Should().BeTrue();
+        context.Response.StatusCode.Should().Be(200);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_NonPostRoutablePath_CallsNext()
+    {
+        var nextCalled = false;
+        var middleware = CreateMiddleware(_ =>
+        {
+            nextCalled = true;
+            return Task.CompletedTask;
+        });
+
+        var context = CreateContext(HttpMethods.Get, "/v1/chat/completions");
+
+        await middleware.InvokeAsync(context);
+
+        nextCalled.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task InvokeAsync_MissingModel_Returns400()
+    {
+        var middleware = CreateMiddleware();
+        var context = CreateContext(
+            HttpMethods.Post,
+            "/v1/chat/completions",
+            """{"stream":false}""");
+
+        await middleware.InvokeAsync(context);
+
+        context.Response.StatusCode.Should().Be(StatusCodes.Status400BadRequest);
+        var body = await ReadResponseBodyAsync(context);
+        body.Should().Contain("missing_model");
+    }
+
+    [Fact]
+    public async Task InvokeAsync_UnknownModel_Returns404()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("missing", out Arg.Any<ModelConfig?>()).Returns(false);
+
+        var middleware = CreateMiddleware(registry: registry);
+        var context = CreateContext(
+            HttpMethods.Post,
+            "/v1/chat/completions",
+            """{"model":"missing"}""");
+
+        await middleware.InvokeAsync(context);
+
+        context.Response.StatusCode.Should().Be(StatusCodes.Status404NotFound);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_UnhealthyBackend_Returns502()
+    {
+        var configPath = Path.Combine(Path.GetTempPath(), $"Autobahn-mw-{Guid.NewGuid():N}.json");
+        await File.WriteAllTextAsync(configPath, """
+            { "models": [ { "id": "m1", "url": "http://backend:8000", "aliases": [] } ] }
+            """);
+
+        try
+        {
+            var registry = new Autobahn.Registry.Services.ModelRegistryService(
+                NullLogger<Autobahn.Registry.Services.ModelRegistryService>.Instance);
+            await registry.LoadModelsAsync(configPath);
+
+            var health = new BackendHealthStore(Options.Create(new GatewayOptions()));
+            health.SetHealth(new BackendHealth(
+                "m1",
+                "http://backend:8000",
+                IsHealthy: false,
+                StatusCode: 503,
+                Error: "down",
+                LastCheckedUtc: DateTimeOffset.UtcNow));
+
+            var forwarder = Substitute.For<IInferenceHttpForwarder>();
+            var middleware = CreateMiddleware(registry: registry, healthStore: health, forwarder: forwarder);
+            var context = CreateContext(
+                HttpMethods.Post,
+                "/v1/chat/completions",
+                """{"model":"m1"}""");
+
+            await middleware.InvokeAsync(context);
+
+            context.Response.StatusCode.Should().Be(StatusCodes.Status502BadGateway);
+            await forwarder.DidNotReceive().SendAsync(
+                Arg.Any<HttpContext>(),
+                Arg.Any<string>(),
+                Arg.Any<string?>(),
+                Arg.Any<StreamingHttpTransformer>(),
+                Arg.Any<bool>(),
+                Arg.Any<InferenceForwardTimeouts>(),
+                Arg.Any<CancellationToken>());
+        }
+        finally
+        {
+            File.Delete(configPath);
+        }
+    }
+
+    [Fact]
+    public async Task InvokeAsync_HealthyModel_ForwardsToBackendUrl()
+    {
+        var configPath = Path.Combine(Path.GetTempPath(), $"Autobahn-mw-fwd-{Guid.NewGuid():N}.json");
+        await File.WriteAllTextAsync(configPath, """
+            { "models": [ { "id": "m1", "url": "http://backend:8000", "aliases": ["alias-m"] } ] }
+            """);
+
+        try
+        {
+            var registry = new Autobahn.Registry.Services.ModelRegistryService(
+                NullLogger<Autobahn.Registry.Services.ModelRegistryService>.Instance);
+            await registry.LoadModelsAsync(configPath);
+
+            var health = Substitute.For<IBackendHealthStore>();
+            health.IsBackendHealthy("m1").Returns(true);
+            health.IsBackendHealthy("m1", Arg.Any<string>()).Returns(true);
+
+            var forwarder = Substitute.For<IInferenceHttpForwarder>();
+            forwarder.SendAsync(
+                    Arg.Any<HttpContext>(),
+                    Arg.Any<string>(),
+                    Arg.Any<string?>(),
+                    Arg.Any<StreamingHttpTransformer>(),
+                    Arg.Any<bool>(),
+                    Arg.Any<InferenceForwardTimeouts>(),
+                    Arg.Any<CancellationToken>())
+                .Returns(ForwarderError.None);
+
+            var middleware = CreateMiddleware(registry: registry, healthStore: health, forwarder: forwarder);
+            var context = CreateContext(
+                HttpMethods.Post,
+                "/v1/chat/completions",
+                """{"model":"alias-m","stream":false}""");
+
+            await middleware.InvokeAsync(context);
+
+            await forwarder.Received(1).SendAsync(
+                Arg.Any<HttpContext>(),
+                "http://backend:8000",
+                Arg.Any<string?>(),
+                Arg.Any<StreamingHttpTransformer>(),
+                false,
+                Arg.Any<InferenceForwardTimeouts>(),
+                Arg.Any<CancellationToken>());
+        }
+        finally
+        {
+            File.Delete(configPath);
+        }
+    }
+
+    [Fact]
+    public async Task InvokeAsync_PostRerank_ForwardsToBackend()
+    {
+        var configPath = Path.Combine(Path.GetTempPath(), $"Autobahn-mw-rerank-{Guid.NewGuid():N}.json");
+        await File.WriteAllTextAsync(configPath, """
+            { "models": [ { "id": "reranker", "url": "http://backend:8000", "aliases": [] } ] }
+            """);
+
+        try
+        {
+            var registry = new Autobahn.Registry.Services.ModelRegistryService(
+                NullLogger<Autobahn.Registry.Services.ModelRegistryService>.Instance);
+            await registry.LoadModelsAsync(configPath);
+
+            var health = Substitute.For<IBackendHealthStore>();
+            health.IsBackendHealthy("reranker").Returns(true);
+            health.IsBackendHealthy("reranker", Arg.Any<string>()).Returns(true);
+
+            var forwarder = Substitute.For<IInferenceHttpForwarder>();
+            forwarder.SendAsync(
+                    Arg.Any<HttpContext>(),
+                    Arg.Any<string>(),
+                    Arg.Any<string?>(),
+                    Arg.Any<StreamingHttpTransformer>(),
+                    Arg.Any<bool>(),
+                    Arg.Any<InferenceForwardTimeouts>(),
+                    Arg.Any<CancellationToken>())
+                .Returns(ForwarderError.None);
+
+            var middleware = CreateMiddleware(registry: registry, healthStore: health, forwarder: forwarder);
+            var context = CreateContext(
+                HttpMethods.Post,
+                "/v1/rerank",
+                """{"model":"reranker","query":"test","documents":["doc"]}""");
+
+            await middleware.InvokeAsync(context);
+
+            await forwarder.Received(1).SendAsync(
+                Arg.Any<HttpContext>(),
+                "http://backend:8000",
+                Arg.Any<string?>(),
+                Arg.Any<StreamingHttpTransformer>(),
+                false,
+                Arg.Any<InferenceForwardTimeouts>(),
+                Arg.Any<CancellationToken>());
+        }
+        finally
+        {
+            File.Delete(configPath);
+        }
+    }
+
+    [Fact]
+    public async Task InvokeAsync_InvalidJson_Returns400()
+    {
+        var middleware = CreateMiddleware();
+        var context = CreateContext(
+            HttpMethods.Post,
+            "/v1/chat/completions",
+            "{ not-json");
+
+        await middleware.InvokeAsync(context);
+
+        context.Response.StatusCode.Should().Be(StatusCodes.Status400BadRequest);
+        var body = await ReadResponseBodyAsync(context);
+        body.Should().Contain("invalid_json");
+    }
+
+    private static DefaultHttpContext CreateContext(string method, string path, string? body = null)
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = method;
+        context.Request.Path = path;
+        context.Request.Body = new MemoryStream(
+            Encoding.UTF8.GetBytes(body ?? string.Empty));
+        context.Request.ContentType = "application/json";
+        context.Response.Body = new MemoryStream();
+        return context;
+    }
+
+    private static void SetInferenceUser(DefaultHttpContext context, Guid tenantId, Guid apiKeyId)
+    {
+        var identity = new ClaimsIdentity(
+        [
+            new Claim(GatewayAuthClaims.TenantId, tenantId.ToString()),
+            new Claim(GatewayAuthClaims.ApiKeyId, apiKeyId.ToString()),
+            new Claim(GatewayAuthClaims.Role, ApiKeyRole.Inference.ToString()),
+        ],
+        GatewayAuthSchemes.ApiKey);
+        context.User = new ClaimsPrincipal(identity);
+        context.Items[TenantContextKeys.HttpContextItemKey] = new TenantContext
+        {
+            TenantId = tenantId.ToString(),
+            ApiKeyId = apiKeyId.ToString(),
+            Role = ApiKeyRole.Inference,
+        };
+    }
+
+    private static async Task<string> ReadResponseBodyAsync(HttpContext context)
+    {
+        context.Response.Body.Position = 0;
+        using var reader = new StreamReader(context.Response.Body, Encoding.UTF8);
+        return await reader.ReadToEndAsync();
+    }
+
+    [Fact]
+    public async Task InvokeAsync_PublicModel_SkipsGrantCheckEvenWhenDenied()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("m1", out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = new ModelConfig { Id = "m1", Url = "http://backend:8000", PublicAccess = true };
+                return true;
+            });
+
+        var tenantId = Guid.NewGuid();
+        var modelGrants = Substitute.For<IModelGrantService>();
+        modelGrants.IsModelAllowedAsync(tenantId, Arg.Any<Guid>(), "m1", Arg.Any<CancellationToken>())
+            .Returns(false);
+
+        var scopeFactory = Substitute.For<IServiceScopeFactory>();
+        var scope = Substitute.For<IServiceScope>();
+        var scopeProvider = Substitute.For<IServiceProvider>();
+        scopeFactory.CreateAsyncScope().Returns(scope);
+        scope.ServiceProvider.Returns(scopeProvider);
+        scopeProvider.GetService(typeof(IModelGrantService)).Returns(modelGrants);
+
+        var authState = Substitute.For<IGatewayAuthenticationState>();
+        authState.IsAuthenticationRequired.Returns(true);
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy("m1").Returns(true);
+        health.IsBackendHealthy("m1", Arg.Any<string>()).Returns(true);
+
+        var forwarder = Substitute.For<IInferenceHttpForwarder>();
+        forwarder.SendAsync(
+                Arg.Any<HttpContext>(),
+                Arg.Any<string>(),
+                Arg.Any<string?>(),
+                Arg.Any<StreamingHttpTransformer>(),
+                Arg.Any<bool>(),
+                Arg.Any<InferenceForwardTimeouts>(),
+                Arg.Any<CancellationToken>())
+            .Returns(ForwarderError.None);
+
+        var middleware = CreateMiddleware(
+            registry: registry,
+            scopeFactory: scopeFactory,
+            authState: authState,
+            healthStore: health,
+            forwarder: forwarder);
+
+        var context = CreateContext(
+            HttpMethods.Post,
+            "/v1/chat/completions",
+            """{"model":"m1"}""");
+        SetInferenceUser(context, tenantId, Guid.NewGuid());
+
+        await middleware.InvokeAsync(context);
+
+        context.Response.StatusCode.Should().NotBe(StatusCodes.Status403Forbidden);
+        await modelGrants.DidNotReceive()
+            .IsModelAllowedAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task InvokeAsync_AuthRequired_NoKey_Returns401InvalidApiKey()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("m1", out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = new ModelConfig { Id = "m1", Url = "http://backend:8000" };
+                return true;
+            });
+
+        var authState = Substitute.For<IGatewayAuthenticationState>();
+        authState.IsAuthenticationRequired.Returns(true);
+
+        var middleware = CreateMiddleware(registry: registry, authState: authState);
+        var context = CreateContext(
+            HttpMethods.Post,
+            "/v1/chat/completions",
+            """{"model":"m1"}""");
+
+        await middleware.InvokeAsync(context);
+
+        context.Response.StatusCode.Should().Be(StatusCodes.Status401Unauthorized);
+        var body = await ReadResponseBodyAsync(context);
+        body.Should().Contain("invalid_api_key");
+    }
+
+    [Theory]
+    [InlineData(ModelAccessRefusal.ModelNotOnKeyList, "model_not_on_key_list")]
+    [InlineData(ModelAccessRefusal.ProviderClosedForTenant, "provider_closed_for_tenant")]
+    [InlineData(ModelAccessRefusal.ProviderClosedForKey, "provider_closed_for_key")]
+    [InlineData(ModelAccessRefusal.ModelNotOnTenantList, "insufficient_scope")]
+    public async Task InvokeAsync_GrantDenied_Returns403NamingTheRule(ModelAccessRefusal refusal, string expectedCode)
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("m1", out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = new ModelConfig { Id = "m1", Url = "http://backend:8000" };
+                return true;
+            });
+
+        var tenantId = Guid.NewGuid();
+        var modelGrants = Substitute.For<IModelGrantService>();
+        modelGrants.EvaluateAsync(tenantId, Arg.Any<Guid>(), "m1", Arg.Any<CancellationToken>())
+            .Returns(new ModelAccessDecision(refusal, ModelProviders.OpenRouter));
+
+        var scopeFactory = Substitute.For<IServiceScopeFactory>();
+        var scope = Substitute.For<IServiceScope>();
+        var scopeProvider = Substitute.For<IServiceProvider>();
+        scopeFactory.CreateAsyncScope().Returns(scope);
+        scope.ServiceProvider.Returns(scopeProvider);
+        scopeProvider.GetService(typeof(IModelGrantService)).Returns(modelGrants);
+
+        var authState = Substitute.For<IGatewayAuthenticationState>();
+        authState.IsAuthenticationRequired.Returns(true);
+
+        var requestTracker = Substitute.For<IRequestTracker>();
+        var errorRecorder = Substitute.For<IGatewayErrorRecorder>();
+        var middleware = CreateMiddleware(
+            registry: registry,
+            scopeFactory: scopeFactory,
+            authState: authState,
+            requestTracker: requestTracker,
+            errorRecorder: errorRecorder);
+
+        var context = CreateContext(
+            HttpMethods.Post,
+            "/v1/chat/completions",
+            """{"model":"m1"}""");
+        SetInferenceUser(context, tenantId, Guid.NewGuid());
+
+        await middleware.InvokeAsync(context);
+
+        context.Response.StatusCode.Should().Be(StatusCodes.Status403Forbidden);
+        var body = await ReadResponseBodyAsync(context);
+        var reason = refusal.ToReason()!;
+        body.Should().Contain($"\"code\":\"{expectedCode}\"");
+        body.Should().Contain($"\"reason\":\"{reason}\"");
+        context.Response.Headers[GatewayHeaders.ErrorCode].ToString().Should().Be(expectedCode);
+        // The refusal is counted like the other admission rejections so it reaches the Overview —
+        // and stored, so the Overview count and the Errors tab agree on it.
+        requestTracker.Received(1).RecordRejectedRequest("m1", reason, Arg.Any<MetricCaller>(), Arg.Any<string>());
+        errorRecorder.Received(1).Record(Arg.Is<GatewayErrorRecord>(r =>
+            r.Outcome == reason && r.ModelId == "m1" && r.StatusCode == StatusCodes.Status403Forbidden));
+    }
+
+    /// <summary>
+    /// The forwarder stashes the transport exception; the proxy record must carry it, with the
+    /// exception-derived hint, so "connection refused" is readable from the Errors tab.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_ForwardFailure_RecordsTheUpstreamExceptionOnTheErrorRecord()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var refused = new HttpRequestException(
+                "Connection refused",
+                new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.ConnectionRefused));
+            var forwarder = Substitute.For<IInferenceHttpForwarder>();
+            forwarder.SendAsync(
+                    Arg.Any<HttpContext>(),
+                    Arg.Any<string>(),
+                    Arg.Any<string?>(),
+                    Arg.Any<StreamingHttpTransformer>(),
+                    Arg.Any<bool>(),
+                    Arg.Any<InferenceForwardTimeouts>(),
+                    Arg.Any<CancellationToken>())
+                .Returns(call =>
+                {
+                    call.Arg<HttpContext>().Items[GatewayErrorContextKeys.UpstreamException] = refused;
+                    return ForwarderError.Request;
+                });
+
+            var errorRecorder = Substitute.For<IGatewayErrorRecorder>();
+            var middleware = CreateMiddleware(registry: registry, forwarder: forwarder, errorRecorder: errorRecorder);
+
+            await middleware.InvokeAsync(CreateContext(HttpMethods.Post, "/v1/chat/completions", """{"model":"m1"}"""));
+
+            errorRecorder.Received(1).Record(Arg.Is<GatewayErrorRecord>(r =>
+                r.ExceptionType == typeof(HttpRequestException).FullName
+                && r.StackTrace!.Contains("Connection refused")
+                && r.Hint!.Contains("Nothing is listening")));
+        });
+    }
+
+    /// <summary>
+    /// An exception escaping the forward reaches the client as a 502 from the terminal handler. The
+    /// inference scope must record it as a failure, not default to success on dispose — otherwise
+    /// the Errors tab stores a record the Overview error count never saw.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_ForwarderThrows_MarksTheInferenceScopeFailed()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var forwarder = Substitute.For<IInferenceHttpForwarder>();
+            forwarder.SendAsync(
+                    Arg.Any<HttpContext>(),
+                    Arg.Any<string>(),
+                    Arg.Any<string?>(),
+                    Arg.Any<StreamingHttpTransformer>(),
+                    Arg.Any<bool>(),
+                    Arg.Any<InferenceForwardTimeouts>(),
+                    Arg.Any<CancellationToken>())
+                .Returns<ForwarderError>(_ => throw new InvalidOperationException("boom"));
+
+            var scope = Substitute.For<IInferenceRequestScope>();
+            var requestTracker = Substitute.For<IRequestTracker>();
+            requestTracker.BeginInferenceRequest(Arg.Any<string>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<MetricCaller>())
+                .Returns(scope);
+
+            var middleware = CreateMiddleware(registry: registry, forwarder: forwarder, requestTracker: requestTracker);
+            var context = CreateContext(HttpMethods.Post, "/v1/chat/completions", """{"model":"m1"}""");
+
+            var act = () => middleware.InvokeAsync(context);
+
+            await act.Should().ThrowAsync<InvalidOperationException>();
+            scope.Received(1).SetOutcome(false, "unhandled");
+            scope.Received(1).Dispose();
+        });
+    }
+
+    [Fact]
+    public async Task InvokeAsync_BulkheadSaturated_Returns429ConcurrencyLimit()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("m1", out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = new ModelConfig { Id = "m1", Url = "http://backend:8000" };
+                return true;
+            });
+
+        var bulkheadOptions = Options.Create(new GatewayOptions
+        {
+            Resilience = new GatewayResilienceOptions { MaxConcurrentForwardsPerModel = 1 },
+        });
+        var bulkhead = new BulkheadRegistry(bulkheadOptions, Substitute.For<IGatewayMetricsCollector>());
+        var held = await bulkhead.TryAcquireAsync("m1", CancellationToken.None);
+
+        try
+        {
+            var middleware = CreateMiddleware(registry: registry, bulkhead: bulkhead);
+            var context = CreateContext(
+                HttpMethods.Post,
+                "/v1/chat/completions",
+                """{"model":"m1"}""");
+
+            await middleware.InvokeAsync(context);
+
+            // Gateway-side admission control, not a backend failure. Reporting it as 502
+            // backend_error told OpenAI-compatible routers the model itself had failed, so they
+            // marked it down and failed over instead of simply retrying.
+            context.Response.StatusCode.Should().Be(StatusCodes.Status429TooManyRequests);
+            var body = await ReadResponseBodyAsync(context);
+            body.Should().Contain("concurrency_limit_exceeded");
+            context.Response.Headers.RetryAfter.ToString().Should().NotBeNullOrEmpty();
+        }
+        finally
+        {
+            held?.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task InvokeAsync_UpstreamAuthConfiguredButTokenMissing_Returns502()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("cloud-model", out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = new ModelConfig
+                {
+                    Id = "cloud-model",
+                    Url = "http://backend:8000",
+                    UpstreamAuth = new UpstreamAuthConfig { Type = "bearer", EnvVar = "OPENAI_API_KEY" },
+                };
+                return true;
+            });
+
+        var tokenResolver = Substitute.For<IUpstreamBearerTokenResolver>();
+        tokenResolver.ResolveBearerToken(Arg.Any<UpstreamAuthConfig?>()).Returns((string?)null);
+
+        var middleware = CreateMiddleware(registry: registry, upstreamTokenResolver: tokenResolver);
+        var context = CreateContext(
+            HttpMethods.Post,
+            "/v1/chat/completions",
+            """{"model":"cloud-model","stream":false}""");
+
+        await middleware.InvokeAsync(context);
+
+        context.Response.StatusCode.Should().Be(StatusCodes.Status502BadGateway);
+        var body = await ReadResponseBodyAsync(context);
+        body.Should().Contain("Upstream auth token not configured");
+    }
+
+    [Fact]
+    public async Task InvokeAsync_RoutedInference_BeginsRequestTracking()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("local-mock", out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = new ModelConfig { Id = "local-mock", Url = "http://backend:8000" };
+                return true;
+            });
+
+        var requestTracker = Substitute.For<IRequestTracker>();
+        requestTracker.BeginInferenceRequest(Arg.Any<string>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<MetricCaller>())
+            .Returns(_ => Substitute.For<IInferenceRequestScope>());
+
+        var middleware = CreateMiddleware(registry: registry, requestTracker: requestTracker);
+        var context = CreateContext(
+            HttpMethods.Post,
+            "/v1/chat/completions",
+            """{"model":"local-mock","stream":false}""");
+
+        await middleware.InvokeAsync(context);
+
+        requestTracker.Received(1).BeginInferenceRequest("local-mock", false, Arg.Any<string?>(), Arg.Any<MetricCaller>());
+    }
+
+    [Fact]
+    public async Task InvokeAsync_ForwardFailure_RecordsRecentRequestWithErrorCode()
+    {
+        var configPath = Path.Combine(Path.GetTempPath(), $"Autobahn-mw-err-{Guid.NewGuid():N}.json");
+        await File.WriteAllTextAsync(configPath, """
+            { "models": [ { "id": "m1", "url": "http://backend:8000", "aliases": [] } ] }
+            """);
+
+        try
+        {
+            var registry = new Autobahn.Registry.Services.ModelRegistryService(
+                NullLogger<Autobahn.Registry.Services.ModelRegistryService>.Instance);
+            await registry.LoadModelsAsync(configPath);
+
+            var health = Substitute.For<IBackendHealthStore>();
+            health.IsBackendHealthy("m1").Returns(true);
+            health.IsBackendHealthy("m1", Arg.Any<string>()).Returns(true);
+
+            var forwarder = Substitute.For<IInferenceHttpForwarder>();
+            forwarder.SendAsync(
+                    Arg.Any<HttpContext>(),
+                    Arg.Any<string>(),
+                    Arg.Any<string?>(),
+                    Arg.Any<StreamingHttpTransformer>(),
+                    Arg.Any<bool>(),
+                    Arg.Any<InferenceForwardTimeouts>(),
+                    Arg.Any<CancellationToken>())
+                .Returns(ForwarderError.Request);
+
+            RecentRequestEntry? recorded = null;
+            var recentRequestStore = Substitute.For<IRecentRequestStore>();
+            recentRequestStore.When(x => x.Record(Arg.Any<RecentRequestEntry>()))
+                .Do(call => recorded = call.Arg<RecentRequestEntry>());
+
+            var middleware = CreateMiddleware(
+                registry: registry,
+                healthStore: health,
+                forwarder: forwarder,
+                recentRequestStore: recentRequestStore);
+            var context = CreateContext(
+                HttpMethods.Post,
+                "/v1/chat/completions",
+                """{"model":"m1","stream":false}""");
+
+            await middleware.InvokeAsync(context);
+
+            recorded.Should().NotBeNull();
+            recorded!.ModelId.Should().Be("m1");
+            recorded.ErrorCode.Should().Be("upstream_error");
+            recorded.StatusCode.Should().Be(StatusCodes.Status502BadGateway);
+        }
+        finally
+        {
+            File.Delete(configPath);
+        }
+    }
+
+    [Fact]
+    public async Task InvokeAsync_ForwardSuccess_RecordsRecentRequestWithoutErrorCode()
+    {
+        var configPath = Path.Combine(Path.GetTempPath(), $"Autobahn-mw-ok-{Guid.NewGuid():N}.json");
+        await File.WriteAllTextAsync(configPath, """
+            { "models": [ { "id": "m1", "url": "http://backend:8000", "aliases": [] } ] }
+            """);
+
+        try
+        {
+            var registry = new Autobahn.Registry.Services.ModelRegistryService(
+                NullLogger<Autobahn.Registry.Services.ModelRegistryService>.Instance);
+            await registry.LoadModelsAsync(configPath);
+
+            var health = Substitute.For<IBackendHealthStore>();
+            health.IsBackendHealthy("m1").Returns(true);
+            health.IsBackendHealthy("m1", Arg.Any<string>()).Returns(true);
+
+            var forwarder = Substitute.For<IInferenceHttpForwarder>();
+            forwarder.SendAsync(
+                    Arg.Any<HttpContext>(),
+                    Arg.Any<string>(),
+                    Arg.Any<string?>(),
+                    Arg.Any<StreamingHttpTransformer>(),
+                    Arg.Any<bool>(),
+                    Arg.Any<InferenceForwardTimeouts>(),
+                    Arg.Any<CancellationToken>())
+                .Returns(ForwarderError.None);
+
+            RecentRequestEntry? recorded = null;
+            var recentRequestStore = Substitute.For<IRecentRequestStore>();
+            recentRequestStore.When(x => x.Record(Arg.Any<RecentRequestEntry>()))
+                .Do(call => recorded = call.Arg<RecentRequestEntry>());
+
+            var middleware = CreateMiddleware(
+                registry: registry,
+                healthStore: health,
+                forwarder: forwarder,
+                recentRequestStore: recentRequestStore);
+            var context = CreateContext(
+                HttpMethods.Post,
+                "/v1/chat/completions",
+                """{"model":"m1","stream":false}""");
+
+            await middleware.InvokeAsync(context);
+
+            recorded.Should().NotBeNull();
+            recorded!.ErrorCode.Should().BeNull();
+        }
+        finally
+        {
+            File.Delete(configPath);
+        }
+    }
+
+    /// <summary>
+    /// The cost center is known at admission (it rides on the tenant context), so both the
+    /// in-flight row and the completed row carry it — the Overview shows who is paying for a
+    /// request while it is still running.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_StampsTheCostCenterOnTheInFlightAndCompletedFeedRows()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("m1", out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = new ModelConfig { Id = "m1", Url = "http://backend:8000" };
+                return true;
+            });
+
+        var forwarder = Substitute.For<IInferenceHttpForwarder>();
+        forwarder.SendAsync(
+                Arg.Any<HttpContext>(),
+                Arg.Any<string>(),
+                Arg.Any<string?>(),
+                Arg.Any<StreamingHttpTransformer>(),
+                Arg.Any<bool>(),
+                Arg.Any<InferenceForwardTimeouts>(),
+                Arg.Any<CancellationToken>())
+            .Returns(ForwarderError.None);
+
+        RecentRequestEntry? started = null;
+        RecentRequestEntry? recorded = null;
+        var recentRequestStore = Substitute.For<IRecentRequestStore>();
+        recentRequestStore.When(x => x.BeginInFlight(Arg.Any<RecentRequestEntry>()))
+            .Do(call => started = call.Arg<RecentRequestEntry>());
+        recentRequestStore.When(x => x.Record(Arg.Any<RecentRequestEntry>()))
+            .Do(call => recorded = call.Arg<RecentRequestEntry>());
+
+        var middleware = CreateMiddleware(
+            registry: registry,
+            forwarder: forwarder,
+            recentRequestStore: recentRequestStore);
+        var context = CreateContext(
+            HttpMethods.Post,
+            "/v1/chat/completions",
+            """{"model":"m1","stream":false}""");
+        var tenantId = Guid.NewGuid();
+        SetInferenceUser(context, tenantId, Guid.NewGuid());
+        context.Items[TenantContextKeys.HttpContextItemKey] = new TenantContext
+        {
+            TenantId = tenantId.ToString(),
+            ApiKeyId = Guid.NewGuid().ToString(),
+            Role = ApiKeyRole.Inference,
+            CostCenter = "FIN-204",
+        };
+
+        await middleware.InvokeAsync(context);
+
+        started.Should().NotBeNull();
+        started!.CostCenter.Should().Be("FIN-204");
+        started.IsInFlight.Should().BeTrue();
+        recorded.Should().NotBeNull();
+        recorded!.CostCenter.Should().Be("FIN-204");
+        // The stubbed forwarder produced no body, so no usage — and the row must say so rather
+        // than promise a price that will never arrive.
+        recorded.PricingStatus.Should().BeNull();
+        recorded.PromptTokens.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task InvokeAsync_UnknownModel_DoesNotRecordRecentRequest()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("missing", out Arg.Any<ModelConfig?>()).Returns(false);
+
+        var recentRequestStore = Substitute.For<IRecentRequestStore>();
+        var middleware = CreateMiddleware(registry: registry, recentRequestStore: recentRequestStore);
+        var context = CreateContext(
+            HttpMethods.Post,
+            "/v1/chat/completions",
+            """{"model":"missing"}""");
+
+        await middleware.InvokeAsync(context);
+
+        recentRequestStore.DidNotReceive().Record(Arg.Any<RecentRequestEntry>());
+    }
+
+    /// <summary>
+    /// A header timeout (no response at all) remains a backend-health signal: it records an
+    /// upstream_error to the client and counts as a circuit-breaker failure.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_HeaderTimeout_RecordsRecentRequestWithErrorCode()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            RecentRequestEntry? recorded = null;
+            var recentRequestStore = Substitute.For<IRecentRequestStore>();
+            recentRequestStore.When(x => x.Record(Arg.Any<RecentRequestEntry>()))
+                .Do(call => recorded = call.Arg<RecentRequestEntry>());
+
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: CreateForwarderReturning(ForwarderError.RequestTimedOut),
+                recentRequestStore: recentRequestStore);
+
+            var context = CreateContext(
+                HttpMethods.Post,
+                "/v1/chat/completions",
+                """{"model":"m1","stream":false}""");
+
+            await middleware.InvokeAsync(context);
+
+            recorded.Should().NotBeNull();
+            recorded!.ErrorCode.Should().Be("upstream_error");
+            recorded.StatusCode.Should().Be(StatusCodes.Status502BadGateway);
+        });
+    }
+
+    /// <summary>
+    /// The header timeout is the only deadline the middleware treats as backend ill-health, so it
+    /// must still trip the breaker at the configured threshold.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_HeaderTimeout_CountsAsCircuitBreakerFailure()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var breakers = CreateBreakerRegistry(failureThreshold: 2);
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: CreateForwarderReturning(ForwarderError.RequestTimedOut),
+                circuitBreakers: breakers);
+
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":true}"""));
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":true}"""));
+
+            breakers.GetBreaker("m1").State.Should().Be(CircuitState.Open);
+        });
+    }
+
+    /// <summary>
+    /// A long but healthy stream is the case the split timeouts exist for: the forwarder returns
+    /// success after far longer than ForwardTimeoutSeconds and the request must be recorded as a
+    /// success, with the breaker closed.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_StreamOutlastingForwardTimeout_IsRecordedAsSuccess()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var breakers = CreateBreakerRegistry(failureThreshold: 1);
+
+            var forwarder = Substitute.For<IInferenceHttpForwarder>();
+            forwarder.SendAsync(
+                    Arg.Any<HttpContext>(),
+                    Arg.Any<string>(),
+                    Arg.Any<string?>(),
+                    Arg.Any<StreamingHttpTransformer>(),
+                    Arg.Any<bool>(),
+                    Arg.Any<InferenceForwardTimeouts>(),
+                    Arg.Any<CancellationToken>())
+                .Returns(async _ =>
+                {
+                    // Comfortably longer than the 1s header timeout configured below. Under the old
+                    // single-deadline design this was cancelled and recorded as a backend failure.
+                    await Task.Delay(TimeSpan.FromMilliseconds(1_500)).ConfigureAwait(false);
+                    return ForwarderError.None;
+                });
+
+            RecentRequestEntry? recorded = null;
+            var recentRequestStore = Substitute.For<IRecentRequestStore>();
+            recentRequestStore.When(x => x.Record(Arg.Any<RecentRequestEntry>()))
+                .Do(call => recorded = call.Arg<RecentRequestEntry>());
+
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: forwarder,
+                recentRequestStore: recentRequestStore,
+                gatewayOptions: new GatewayOptions
+                {
+                    Resilience = new GatewayResilienceOptions { ForwardTimeoutSeconds = 1 },
+                },
+                circuitBreakers: breakers);
+
+            var context = CreateContext(
+                HttpMethods.Post,
+                "/v1/chat/completions",
+                """{"model":"m1","stream":true}""");
+
+            await middleware.InvokeAsync(context);
+
+            recorded.Should().NotBeNull();
+            recorded!.ErrorCode.Should().BeNull();
+            recorded.StatusCode.Should().Be(StatusCodes.Status200OK);
+            recorded.DurationMs.Should().BeGreaterThan(1_000);
+            breakers.GetBreaker("m1").State.Should().Be(CircuitState.Closed);
+        });
+    }
+
+    /// <summary>
+    /// A mid-stream stall is inconclusive about backend health (the backend already answered), so it
+    /// abandons the probe instead of counting a failure. With a threshold of 1, a counted failure
+    /// would open the circuit immediately.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_StreamIdleTimeout_DoesNotCountAsCircuitBreakerFailure()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var breakers = CreateBreakerRegistry(failureThreshold: 1);
+
+            RecentRequestEntry? recorded = null;
+            var recentRequestStore = Substitute.For<IRecentRequestStore>();
+            recentRequestStore.When(x => x.Record(Arg.Any<RecentRequestEntry>()))
+                .Do(call => recorded = call.Arg<RecentRequestEntry>());
+
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: CreateForwarderReturning(ForwarderError.ResponseBodyCanceled),
+                recentRequestStore: recentRequestStore,
+                circuitBreakers: breakers);
+
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":true}"""));
+
+            breakers.GetBreaker("m1").State.Should().Be(CircuitState.Closed);
+            recorded.Should().NotBeNull();
+        });
+    }
+
+    /// <summary>
+    /// Headers followed by nothing is a time-to-first-token failure, not a mid-stream stall: the
+    /// record must say so, carry the zero byte count, and group apart from a generation that stopped
+    /// mid-stream — 162 of them were pooled under one message that read as "stopped sending", when
+    /// nothing had ever been sent.
+    /// </summary>
+    /// <remarks>
+    /// It is also the one stall the breaker counts. For an SSE backend the response headers are
+    /// written on admission, before scheduling and before prefill, so they are not evidence that
+    /// anything works; producing no byte at all for the whole first-byte allowance is. With a
+    /// threshold of 1 an uncounted outcome would leave the breaker closed.
+    /// </remarks>
+    [Fact]
+    public async Task InvokeAsync_StreamIdleTimeoutWithNothingForwarded_IsRecordedAsAFirstTokenFailure()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var breakers = CreateBreakerRegistry(failureThreshold: 1);
+            var forwarder = Substitute.For<IInferenceHttpForwarder>();
+            forwarder.SendAsync(
+                    Arg.Any<HttpContext>(),
+                    Arg.Any<string>(),
+                    Arg.Any<string?>(),
+                    Arg.Any<StreamingHttpTransformer>(),
+                    Arg.Any<bool>(),
+                    Arg.Any<InferenceForwardTimeouts>(),
+                    Arg.Any<CancellationToken>())
+                .Returns(call =>
+                {
+                    call.Arg<HttpContext>().Items[InferenceForwardingContextKeys.ResponseBytesForwarded] = 0L;
+                    return ForwarderError.ResponseBodyCanceled;
+                });
+            var errorRecorder = Substitute.For<IGatewayErrorRecorder>();
+
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: forwarder,
+                circuitBreakers: breakers,
+                errorRecorder: errorRecorder);
+
+            var context = CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":true}""");
+            await middleware.InvokeAsync(context);
+
+            errorRecorder.Received(1).Record(Arg.Is<GatewayErrorRecord>(r =>
+                r.Outcome == "upstream_first_byte_timeout"
+                && r.Message.Contains("never started sending the response body")
+                && r.ResponseBytesForwarded == 0
+                && r.IsStreaming == true
+                && r.TimeToFirstTokenMs == null
+                && r.Level == "Error"));
+            breakers.GetBreaker("m1").State.Should().Be(
+                CircuitState.Open,
+                "headers with no body at all is backend ill health, unlike a stall after real tokens");
+        });
+    }
+
+    /// <summary>
+    /// The complement, and the line the breaker policy turns on: a stall after real tokens stays
+    /// uncounted, because the backend demonstrably produced output. Counting both would let one slow
+    /// consumer-side incident take a working model out of service.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_StreamIdleTimeoutAfterBytesForwarded_IsNotCountedAgainstTheBreaker()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var breakers = CreateBreakerRegistry(failureThreshold: 1);
+            var forwarder = Substitute.For<IInferenceHttpForwarder>();
+            forwarder.SendAsync(
+                    Arg.Any<HttpContext>(),
+                    Arg.Any<string>(),
+                    Arg.Any<string?>(),
+                    Arg.Any<StreamingHttpTransformer>(),
+                    Arg.Any<bool>(),
+                    Arg.Any<InferenceForwardTimeouts>(),
+                    Arg.Any<CancellationToken>())
+                .Returns(call =>
+                {
+                    call.Arg<HttpContext>().Items[InferenceForwardingContextKeys.ResponseBytesForwarded] = 8_192L;
+                    return ForwarderError.ResponseBodyCanceled;
+                });
+
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: forwarder,
+                circuitBreakers: breakers);
+
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":true}"""));
+
+            breakers.GetBreaker("m1").State.Should().Be(CircuitState.Closed);
+        });
+    }
+
+    /// <summary>
+    /// A client that holds the socket open and stops reading is holding the upstream connection, the
+    /// bulkhead slot and the budget reservation with it — a fault worth recording. It says nothing
+    /// about the backend, so it must not touch the breaker, and it must stay distinct from a clean
+    /// client_canceled, which is deliberately kept out of the error store.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_DownstreamWriteTimeout_IsRecordedWithoutBlamingTheBackend()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var breakers = CreateBreakerRegistry(failureThreshold: 1);
+            var forwarder = Substitute.For<IInferenceHttpForwarder>();
+            forwarder.SendAsync(
+                    Arg.Any<HttpContext>(),
+                    Arg.Any<string>(),
+                    Arg.Any<string?>(),
+                    Arg.Any<StreamingHttpTransformer>(),
+                    Arg.Any<bool>(),
+                    Arg.Any<InferenceForwardTimeouts>(),
+                    Arg.Any<CancellationToken>())
+                .Returns(call =>
+                {
+                    call.Arg<HttpContext>().Items[InferenceForwardingContextKeys.ResponseBytesForwarded] = 2_048L;
+                    return ForwarderError.ResponseBodyClient;
+                });
+            var errorRecorder = Substitute.For<IGatewayErrorRecorder>();
+
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: forwarder,
+                circuitBreakers: breakers,
+                errorRecorder: errorRecorder);
+
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":true}"""));
+
+            breakers.GetBreaker("m1").State.Should().Be(
+                CircuitState.Closed,
+                "a consumer that stops reading is no evidence about the backend");
+            errorRecorder.Received(1).Record(Arg.Is<GatewayErrorRecord>(r =>
+                r.Outcome == "client_write_timeout"
+                && r.Message.Contains("Client stopped reading the response body")
+                && r.ResponseBytesForwarded == 2_048
+                && r.Level == "Warning"));
+        });
+    }
+
+    /// <summary>A stall after bytes were forwarded keeps the mid-stream wording and the count.</summary>
+    [Fact]
+    public async Task InvokeAsync_StreamIdleTimeoutAfterBytesForwarded_IsRecordedAsAMidStreamStall()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var forwarder = Substitute.For<IInferenceHttpForwarder>();
+            forwarder.SendAsync(
+                    Arg.Any<HttpContext>(),
+                    Arg.Any<string>(),
+                    Arg.Any<string?>(),
+                    Arg.Any<StreamingHttpTransformer>(),
+                    Arg.Any<bool>(),
+                    Arg.Any<InferenceForwardTimeouts>(),
+                    Arg.Any<CancellationToken>())
+                .Returns(call =>
+                {
+                    var items = call.Arg<HttpContext>().Items;
+                    items[InferenceForwardingContextKeys.ResponseBytesForwarded] = 4_096L;
+                    items[InferenceForwardingContextKeys.TimeToFirstTokenMs] = 850d;
+                    return ForwarderError.ResponseBodyCanceled;
+                });
+            var errorRecorder = Substitute.For<IGatewayErrorRecorder>();
+
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: forwarder,
+                errorRecorder: errorRecorder);
+
+            var context = CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":true}""");
+            await middleware.InvokeAsync(context);
+
+            errorRecorder.Received(1).Record(Arg.Is<GatewayErrorRecord>(r =>
+                r.Outcome == "stream_idle_timeout"
+                && r.Message.Contains("stopped sending the response body")
+                && r.ResponseBytesForwarded == 4_096
+                && r.TimeToFirstTokenMs == 850d));
+        });
+    }
+
+    /// <summary>
+    /// An upstream that answers and then breaks the body off (reset, premature EOF) is a backend
+    /// failure, unlike a stall or a client hang-up: it counts against the breaker, lands in the
+    /// error store, and — when nothing has reached the client yet — is answered with a 502 rather
+    /// than the upstream's 200 over a truncated body.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_UpstreamBodyError_CountsAsFailureAndWrites502WhenNotStarted()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var breakers = CreateBreakerRegistry(failureThreshold: 1);
+
+            RecentRequestEntry? recorded = null;
+            var recentRequestStore = Substitute.For<IRecentRequestStore>();
+            recentRequestStore.When(x => x.Record(Arg.Any<RecentRequestEntry>()))
+                .Do(call => recorded = call.Arg<RecentRequestEntry>());
+
+            var errorRecorder = Substitute.For<IGatewayErrorRecorder>();
+
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: CreateForwarderReturning(ForwarderError.ResponseBodyDestination),
+                recentRequestStore: recentRequestStore,
+                circuitBreakers: breakers,
+                errorRecorder: errorRecorder);
+
+            var context = CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":false}""");
+            await middleware.InvokeAsync(context);
+
+            breakers.GetBreaker("m1").State.Should().Be(CircuitState.Open);
+            context.Response.StatusCode.Should().Be(StatusCodes.Status502BadGateway);
+            context.Response.Headers[GatewayHeaders.ErrorCode].ToString().Should().Be("upstream_error");
+
+            recorded.Should().NotBeNull();
+            recorded!.StatusCode.Should().Be(StatusCodes.Status502BadGateway);
+            recorded.ErrorCode.Should().Be("upstream_error");
+
+            errorRecorder.Received(1).Record(Arg.Is<GatewayErrorRecord>(r =>
+                r.Outcome == "upstream_body_error" && r.ModelId == "m1"));
+        });
+    }
+
+    /// <summary>
+    /// A proxied 502, 503 or 504 is a backend failure even though forwarding itself succeeded.
+    /// Counting it as a breaker success meant a backend that degraded into fast errors closed a
+    /// half-open breaker on its first probe and could never re-open it.
+    /// </summary>
+    [Theory]
+    [InlineData(StatusCodes.Status502BadGateway)]
+    [InlineData(StatusCodes.Status503ServiceUnavailable)]
+    [InlineData(StatusCodes.Status504GatewayTimeout)]
+    public async Task InvokeAsync_UpstreamUnavailableStatus_CountsAsCircuitBreakerFailure(int status)
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var breakers = CreateBreakerRegistry(failureThreshold: 2);
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: CreateForwarderProxyingStatus(status),
+                circuitBreakers: breakers);
+
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":false}"""));
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":false}"""));
+
+            breakers.GetBreaker("m1").State.Should().Be(CircuitState.Open);
+        });
+    }
+
+    /// <summary>
+    /// A 500 is an answer. Model servers give it for one caller's request shape while serving
+    /// everyone else, so it is recorded as an error and left out of the breaker's count.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_Upstream500_IsAnErrorButNotACircuitBreakerFailure()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var breakers = CreateBreakerRegistry(failureThreshold: 2);
+
+            RecentRequestEntry? recorded = null;
+            var recentRequestStore = Substitute.For<IRecentRequestStore>();
+            recentRequestStore.When(x => x.Record(Arg.Any<RecentRequestEntry>()))
+                .Do(call => recorded = call.Arg<RecentRequestEntry>());
+
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: CreateForwarderProxyingStatus(StatusCodes.Status500InternalServerError),
+                recentRequestStore: recentRequestStore,
+                circuitBreakers: breakers);
+
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":false}"""));
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":false}"""));
+
+            breakers.GetBreaker("m1").State.Should().Be(CircuitState.Closed);
+            recorded.Should().NotBeNull();
+            recorded!.StatusCode.Should().Be(StatusCodes.Status500InternalServerError);
+        });
+    }
+
+    /// <summary>
+    /// A proxied 4xx means the backend answered and the request was wrong — not a health signal.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_Upstream4xx_DoesNotCountAsCircuitBreakerFailure()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var breakers = CreateBreakerRegistry(failureThreshold: 1);
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: CreateForwarderProxyingStatus(StatusCodes.Status400BadRequest),
+                circuitBreakers: breakers);
+
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":false}"""));
+
+            breakers.GetBreaker("m1").State.Should().Be(CircuitState.Closed);
+        });
+    }
+
+    /// <summary>
+    /// The breaker and the dashboard ask different questions of the same 4xx. Conflating them meant
+    /// a model rejecting every call with 400 reported "0 errors, 0.00% error rate" on the console
+    /// beside a live feed full of red rows.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_Upstream4xx_IsCountedAsAnErrorOnTheDashboard()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var scope = Substitute.For<IInferenceRequestScope>();
+            var tracker = CreateTrackerReturning(scope);
+            var recent = Substitute.For<IRecentRequestStore>();
+
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: CreateForwarderProxyingStatus(StatusCodes.Status400BadRequest),
+                requestTracker: tracker,
+                recentRequestStore: recent);
+
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":false}"""));
+
+            scope.Received(1).SetOutcome(false, "upstream_4xx");
+            recent.Received(1).Record(Arg.Is<RecentRequestEntry>(e => e.StatusCode == 400));
+        });
+    }
+
+    [Fact]
+    public async Task InvokeAsync_Upstream2xx_IsCountedAsSuccess()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var scope = Substitute.For<IInferenceRequestScope>();
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: CreateForwarderProxyingStatus(StatusCodes.Status200OK),
+                requestTracker: CreateTrackerReturning(scope));
+
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":false}"""));
+
+            scope.Received(1).SetOutcome(true, null);
+        });
+    }
+
+    /// <summary>
+    /// Admission rejections answer the client with an error, so they have to reach the console's
+    /// counters and live feed. Reporting them to Prometheus alone is what let a saturated gateway
+    /// render as calm and error-free while it turned every request away.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_UnhealthyBackend_RecordsRejectionForTheDashboard()
+    {
+        var registry = CreateSingleModelRegistry();
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy(Arg.Any<string>()).Returns(false);
+        health.IsBackendHealthy(Arg.Any<string>(), Arg.Any<string>()).Returns(false);
+
+        var tracker = CreateTrackerReturning(Substitute.For<IInferenceRequestScope>());
+        var recent = Substitute.For<IRecentRequestStore>();
+        var middleware = CreateMiddleware(
+            registry: registry, healthStore: health, requestTracker: tracker, recentRequestStore: recent);
+
+        await middleware.InvokeAsync(CreateContext(
+            HttpMethods.Post, "/v1/chat/completions", """{"model":"m1"}"""));
+
+        tracker.Received(1).RecordRejectedRequest("m1", "backend_unhealthy", Arg.Any<MetricCaller>(), ModelProviders.SelfHosted);
+        recent.Received(1).Record(Arg.Is<RecentRequestEntry>(e =>
+            e.ModelId == "m1" && e.StatusCode >= 400 && !e.IsInFlight));
+    }
+
+    [Fact]
+    public async Task InvokeAsync_CircuitOpen_RecordsRejectionForTheDashboard()
+    {
+        var registry = CreateSingleModelRegistry();
+        var breakers = CreateBreakerRegistry(failureThreshold: 1);
+
+        // Trip it: one 503 forward is enough at a threshold of one.
+        var tripped = CreateMiddleware(
+            registry: registry,
+            forwarder: CreateForwarderProxyingStatus(StatusCodes.Status503ServiceUnavailable),
+            circuitBreakers: breakers);
+        await tripped.InvokeAsync(CreateContext(
+            HttpMethods.Post, "/v1/chat/completions", """{"model":"m1"}"""));
+        breakers.GetBreaker("m1").State.Should().Be(CircuitState.Open);
+
+        var tracker = CreateTrackerReturning(Substitute.For<IInferenceRequestScope>());
+        var recent = Substitute.For<IRecentRequestStore>();
+        var middleware = CreateMiddleware(
+            registry: registry, circuitBreakers: breakers, requestTracker: tracker, recentRequestStore: recent);
+
+        await middleware.InvokeAsync(CreateContext(
+            HttpMethods.Post, "/v1/chat/completions", """{"model":"m1"}"""));
+
+        tracker.Received(1).RecordRejectedRequest("m1", "circuit_open", Arg.Any<MetricCaller>(), ModelProviders.SelfHosted);
+        recent.Received(1).Record(Arg.Any<RecentRequestEntry>());
+    }
+
+    [Fact]
+    public async Task InvokeAsync_BulkheadSaturated_RecordsRejectionForTheDashboard()
+    {
+        var registry = CreateSingleModelRegistry();
+        var bulkhead = new BulkheadRegistry(
+            Options.Create(new GatewayOptions
+            {
+                Resilience = new GatewayResilienceOptions { MaxConcurrentForwardsPerModel = 1 },
+            }),
+            Substitute.For<IGatewayMetricsCollector>());
+        var held = await bulkhead.TryAcquireAsync("m1", CancellationToken.None);
+
+        try
+        {
+            var tracker = CreateTrackerReturning(Substitute.For<IInferenceRequestScope>());
+            var recent = Substitute.For<IRecentRequestStore>();
+            var middleware = CreateMiddleware(
+                registry: registry, bulkhead: bulkhead, requestTracker: tracker, recentRequestStore: recent);
+
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1"}"""));
+
+            tracker.Received(1).RecordRejectedRequest("m1", "bulkhead_full", Arg.Any<MetricCaller>(), ModelProviders.SelfHosted);
+            recent.Received(1).Record(Arg.Is<RecentRequestEntry>(e => e.StatusCode == 429));
+        }
+        finally
+        {
+            held?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The request has to be on the feed while it is running, not only once it has finished — that
+    /// is the whole point of the in-flight entry.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_WhileForwarding_PublishesAnInFlightEntryThenRetiresIt()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var recent = Substitute.For<IRecentRequestStore>();
+            RecentRequestEntry? published = null;
+            var publishedDuringForward = false;
+            recent.When(r => r.BeginInFlight(Arg.Any<RecentRequestEntry>()))
+                .Do(call => published = call.Arg<RecentRequestEntry>());
+
+            var forwarder = Substitute.For<IInferenceHttpForwarder>();
+            forwarder.SendAsync(
+                    Arg.Any<HttpContext>(), Arg.Any<string>(), Arg.Any<string?>(),
+                    Arg.Any<StreamingHttpTransformer>(), Arg.Any<bool>(),
+                    Arg.Any<InferenceForwardTimeouts>(), Arg.Any<CancellationToken>())
+                .Returns(call =>
+                {
+                    // Observed from inside the forward: the entry must already be visible here.
+                    publishedDuringForward = published is not null;
+                    call.Arg<HttpContext>().Response.StatusCode = StatusCodes.Status200OK;
+                    return ForwarderError.None;
+                });
+
+            var middleware = CreateMiddleware(
+                registry: registry, forwarder: forwarder, recentRequestStore: recent);
+
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":false}"""));
+
+            publishedDuringForward.Should().BeTrue();
+            published!.IsInFlight.Should().BeTrue();
+            published.ModelId.Should().Be("m1");
+            published.StatusCode.Should().Be(0);
+
+            recent.Received(1).Record(Arg.Is<RecentRequestEntry>(e => !e.IsInFlight));
+            recent.Received(1).CompleteInFlight(published.RequestId);
+        });
+    }
+
+    private static IRequestTracker CreateTrackerReturning(IInferenceRequestScope scope)
+    {
+        var tracker = Substitute.For<IRequestTracker>();
+        tracker.BeginInferenceRequest(Arg.Any<string>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<MetricCaller>()).Returns(scope);
+        return tracker;
+    }
+
+    /// <summary>
+    /// A model with an ordinary backend and one built for long prompts: an ordinary request stays
+    /// on the ordinary backend even though the other is just as idle.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_SeveralBackends_SmallRequestGoesToTheSmallestThatHoldsIt()
+    {
+        var forwarder = Substitute.For<IInferenceHttpForwarder>();
+        var middleware = CreateMiddleware(registry: CreateTwoTierRegistry(), forwarder: forwarder);
+
+        await middleware.InvokeAsync(CreateContext(
+            HttpMethods.Post, "/v1/chat/completions", """{"model":"m1"}"""));
+
+        await ReceivedForwardTo(forwarder, "http://ordinary:8000");
+    }
+
+    [Fact]
+    public async Task InvokeAsync_SeveralBackends_RequestTooLongForTheSmallOneGoesToTheLargeOne()
+    {
+        var forwarder = Substitute.For<IInferenceHttpForwarder>();
+        var middleware = CreateMiddleware(registry: CreateTwoTierRegistry(), forwarder: forwarder);
+
+        // 100 tokens of context on the ordinary backend; four bytes a token puts this well past it.
+        var prompt = new string('x', 2_000);
+        await middleware.InvokeAsync(CreateContext(
+            HttpMethods.Post,
+            "/v1/chat/completions",
+            $$"""{"model":"m1","messages":[{"role":"user","content":"{{prompt}}"}]}"""));
+
+        await ReceivedForwardTo(forwarder, "http://long:8000");
+    }
+
+    [Fact]
+    public async Task InvokeAsync_SeveralBackends_StoppedBackendReceivesNothing()
+    {
+        var forwarder = Substitute.For<IInferenceHttpForwarder>();
+        var middleware = CreateMiddleware(
+            registry: CreateTwoTierRegistry(ordinaryState: ModelRouteStates.Stopped), forwarder: forwarder);
+
+        await middleware.InvokeAsync(CreateContext(
+            HttpMethods.Post, "/v1/chat/completions", """{"model":"m1"}"""));
+
+        await ReceivedForwardTo(forwarder, "http://long:8000");
+    }
+
+    [Fact]
+    public async Task InvokeAsync_SeveralBackends_UnhealthyBackendIsPassedOver()
+    {
+        var health = new BackendHealthStore(Options.Create(new GatewayOptions()));
+        health.SetHealth(new BackendHealth(
+            "m1", "http://ordinary:8000", IsHealthy: false, StatusCode: 503, Error: "down",
+            LastCheckedUtc: DateTimeOffset.UtcNow, BackendName: "ordinary"));
+        var forwarder = Substitute.For<IInferenceHttpForwarder>();
+        var middleware = CreateMiddleware(registry: CreateTwoTierRegistry(), healthStore: health, forwarder: forwarder);
+
+        var context = CreateContext(HttpMethods.Post, "/v1/chat/completions", """{"model":"m1"}""");
+        await middleware.InvokeAsync(context);
+
+        context.Response.StatusCode.Should().Be(StatusCodes.Status200OK);
+        await ReceivedForwardTo(forwarder, "http://long:8000");
+    }
+
+    /// <summary>
+    /// A backend whose circuit is open refuses, and the request moves to the next one instead of
+    /// being answered circuit_open while another backend could have served it.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_SeveralBackends_OpenCircuitOnTheFirstChoiceFallsToTheNext()
+    {
+        var breakers = CreateBreakerRegistry(failureThreshold: 1);
+        var ordinaryKey = ModelBackends.Key("m1", "ordinary");
+        breakers.TryEnter(ordinaryKey).Should().BeTrue();
+        breakers.RecordFailure(ordinaryKey);
+        breakers.GetBreaker(ordinaryKey).State.Should().Be(CircuitState.Open);
+
+        var forwarder = Substitute.For<IInferenceHttpForwarder>();
+        var middleware = CreateMiddleware(
+            registry: CreateTwoTierRegistry(), forwarder: forwarder, circuitBreakers: breakers);
+
+        var context = CreateContext(HttpMethods.Post, "/v1/chat/completions", """{"model":"m1"}""");
+        await middleware.InvokeAsync(context);
+
+        context.Response.StatusCode.Should().Be(StatusCodes.Status200OK);
+        await ReceivedForwardTo(forwarder, "http://long:8000");
+        breakers.GetBreaker(ordinaryKey).State.Should().Be(CircuitState.Open, "the other backend's outcome is not this one's");
+    }
+
+    /// <summary>
+    /// A model whose backends are all stopped, or that has none left, is registered and forwards
+    /// nothing: it must refuse rather than throw.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_NoBackendInService_IsRefusedAsUnavailable(bool hasBackends)
+    {
+        var model = new ModelConfig
+        {
+            Id = "m1",
+            Backends = hasBackends
+                ? [new ModelBackendConfig { Name = "a", Url = "http://a:8000", State = ModelRouteStates.Stopped }]
+                : [],
+        };
+        var forwarder = Substitute.For<IInferenceHttpForwarder>();
+        var tracker = CreateTrackerReturning(Substitute.For<IInferenceRequestScope>());
+        var middleware = CreateMiddleware(
+            registry: CreateRegistryFor(model), forwarder: forwarder, requestTracker: tracker);
+
+        var context = CreateContext(HttpMethods.Post, "/v1/chat/completions", """{"model":"m1"}""");
+        await middleware.InvokeAsync(context);
+
+        context.Response.StatusCode.Should().Be(StatusCodes.Status502BadGateway);
+        tracker.Received(1).RecordRejectedRequest("m1", "backend_unhealthy", Arg.Any<MetricCaller>(), ModelProviders.SelfHosted);
+        forwarder.ReceivedCalls().Should().BeEmpty();
+    }
+
+    private static Task ReceivedForwardTo(IInferenceHttpForwarder forwarder, string url) =>
+        forwarder.Received(1).SendAsync(
+            Arg.Any<HttpContext>(),
+            url,
+            Arg.Any<string?>(),
+            Arg.Any<StreamingHttpTransformer>(),
+            Arg.Any<bool>(),
+            Arg.Any<InferenceForwardTimeouts>(),
+            Arg.Any<CancellationToken>());
+
+    private static IModelRegistry CreateTwoTierRegistry(string ordinaryState = ModelRouteStates.Serving) =>
+        CreateRegistryFor(new ModelConfig
+        {
+            Id = "m1",
+            Backends =
+            [
+                // Listed long-first, so the order they were registered in cannot be what picks.
+                new ModelBackendConfig { Name = "long", Url = "http://long:8000", MaxContextLength = 1_000_000 },
+                new ModelBackendConfig
+                {
+                    Name = "ordinary", Url = "http://ordinary:8000", MaxContextLength = 100, State = ordinaryState,
+                },
+            ],
+        });
+
+    private static IModelRegistry CreateRegistryFor(ModelConfig model)
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel(model.Id, out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = model;
+                return true;
+            });
+        return registry;
+    }
+
+    private static IModelRegistry CreateSingleModelRegistry()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("m1", out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = new ModelConfig { Id = "m1", Url = "http://backend:8000" };
+                return true;
+            });
+        return registry;
+    }
+
+    /// <summary>
+    /// A burst of client disconnects must not be able to take a healthy model offline.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_ClientCancellation_DoesNotCountAsCircuitBreakerFailure()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            var breakers = CreateBreakerRegistry(failureThreshold: 1);
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: CreateForwarderReturning(ForwarderError.RequestCanceled),
+                circuitBreakers: breakers);
+
+            for (var i = 0; i < 3; i++)
+            {
+                await middleware.InvokeAsync(CreateContext(
+                    HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":true}"""));
+            }
+
+            breakers.GetBreaker("m1").State.Should().Be(CircuitState.Closed);
+        });
+    }
+
+    /// <summary>
+    /// A disconnect keeps the <c>client_canceled</c> outcome and stays out of the error store. Now
+    /// that a stalled consumer has its own outcome, the two must not be allowed to drift into each
+    /// other: a hang-up is routine and unactionable, while a client that holds the socket open and
+    /// stops reading is a fault an operator needs to see.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_ClientCancellation_StaysClientCanceledAndIsNotRecorded()
+    {
+        await WithSingleModelRegistryAsync(async registry =>
+        {
+            RecentRequestEntry? recorded = null;
+            var recentRequestStore = Substitute.For<IRecentRequestStore>();
+            recentRequestStore.When(x => x.Record(Arg.Any<RecentRequestEntry>()))
+                .Do(call => recorded = call.Arg<RecentRequestEntry>());
+            var errorRecorder = Substitute.For<IGatewayErrorRecorder>();
+
+            var middleware = CreateMiddleware(
+                registry: registry,
+                forwarder: CreateForwarderReturning(ForwarderError.RequestCanceled),
+                recentRequestStore: recentRequestStore,
+                errorRecorder: errorRecorder);
+
+            await middleware.InvokeAsync(CreateContext(
+                HttpMethods.Post, "/v1/chat/completions", """{"model":"m1","stream":true}"""));
+
+            recorded.Should().NotBeNull();
+            errorRecorder.DidNotReceive().Record(Arg.Any<GatewayErrorRecord>());
+        });
+    }
+
+    private static IInferenceHttpForwarder CreateForwarderReturning(ForwarderError error)
+    {
+        var forwarder = Substitute.For<IInferenceHttpForwarder>();
+        forwarder.SendAsync(
+                Arg.Any<HttpContext>(),
+                Arg.Any<string>(),
+                Arg.Any<string?>(),
+                Arg.Any<StreamingHttpTransformer>(),
+                Arg.Any<bool>(),
+                Arg.Any<InferenceForwardTimeouts>(),
+                Arg.Any<CancellationToken>())
+            .Returns(error);
+        return forwarder;
+    }
+
+    /// <summary>
+    /// Mimics the real forwarder proxying an upstream response: the status code is written to the
+    /// response and the return value is None, because forwarding itself did not fail.
+    /// </summary>
+    private static IInferenceHttpForwarder CreateForwarderProxyingStatus(int statusCode)
+    {
+        var forwarder = Substitute.For<IInferenceHttpForwarder>();
+        forwarder.SendAsync(
+                Arg.Any<HttpContext>(),
+                Arg.Any<string>(),
+                Arg.Any<string?>(),
+                Arg.Any<StreamingHttpTransformer>(),
+                Arg.Any<bool>(),
+                Arg.Any<InferenceForwardTimeouts>(),
+                Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                call.Arg<HttpContext>().Response.StatusCode = statusCode;
+                return ForwarderError.None;
+            });
+        return forwarder;
+    }
+
+    private static ModelCircuitBreakerRegistry CreateBreakerRegistry(int failureThreshold) =>
+        new(
+            Options.Create(new GatewayOptions
+            {
+                Resilience = new GatewayResilienceOptions
+                {
+                    CircuitBreakerFailureThreshold = failureThreshold,
+                    CircuitBreakerBreakDurationSeconds = 60,
+                },
+            }),
+            Substitute.For<IGatewayMetricsCollector>());
+
+    private static async Task WithSingleModelRegistryAsync(
+        Func<Autobahn.Registry.Services.ModelRegistryService, Task> body)
+    {
+        var configPath = Path.Combine(Path.GetTempPath(), $"Autobahn-mw-{Guid.NewGuid():N}.json");
+        await File.WriteAllTextAsync(configPath, """
+            { "models": [ { "id": "m1", "url": "http://backend:8000", "aliases": [] } ] }
+            """);
+
+        try
+        {
+            var registry = new Autobahn.Registry.Services.ModelRegistryService(
+                NullLogger<Autobahn.Registry.Services.ModelRegistryService>.Instance);
+            await registry.LoadModelsAsync(configPath);
+            await body(registry);
+        }
+        finally
+        {
+            File.Delete(configPath);
+        }
+    }
+
+    /// <summary>
+    /// The same harness, for the rate-limit tests next door: building the router by hand takes
+    /// twenty collaborators, and duplicating that is how the two copies drift apart.
+    /// </summary>
+    internal static ModelRouterMiddleware CreateMiddlewareForRateLimitTests(
+        Autobahn.Registry.Services.ModelRegistryService registry,
+        IInferenceHttpForwarder forwarder,
+        IRateLimitPolicyResolver? rateLimitPolicyResolver = null,
+        IDistributedRateLimitStore? rateLimitStore = null,
+        IAdaptiveRateLimitGovernor? rateLimitGovernor = null,
+        IRateLimitUsageTracker? rateLimitUsage = null,
+        IRateLimitPlanResolver? rateLimitPlanResolver = null) =>
+        CreateMiddleware(
+            registry: registry,
+            forwarder: forwarder,
+            rateLimitPolicyResolver: rateLimitPolicyResolver,
+            rateLimitStore: rateLimitStore,
+            rateLimitGovernor: rateLimitGovernor,
+            rateLimitUsage: rateLimitUsage,
+            rateLimitPlanResolver: rateLimitPlanResolver);
+
+    private static ModelRouterMiddleware CreateMiddleware(
+        RequestDelegate? next = null,
+        IModelRegistry? registry = null,
+        IBackendHealthStore? healthStore = null,
+        IInferenceHttpForwarder? forwarder = null,
+        IErrorResponseWriter? errorWriter = null,
+        IRequestTracker? requestTracker = null,
+        IRecentRequestStore? recentRequestStore = null,
+        IServiceScopeFactory? scopeFactory = null,
+        IGatewayAuthenticationState? authState = null,
+        BulkheadRegistry? bulkhead = null,
+        IUpstreamBearerTokenResolver? upstreamTokenResolver = null,
+        GatewayOptions? gatewayOptions = null,
+        IBudgetEnforcementService? budgetEnforcement = null,
+        ModelCircuitBreakerRegistry? circuitBreakers = null,
+        IGatewayErrorRecorder? errorRecorder = null,
+        IRateLimitPolicyResolver? rateLimitPolicyResolver = null,
+        IDistributedRateLimitStore? rateLimitStore = null,
+        IAdaptiveRateLimitGovernor? rateLimitGovernor = null,
+        IRateLimitUsageTracker? rateLimitUsage = null,
+        IRateLimitPlanResolver? rateLimitPlanResolver = null)
+    {
+        next ??= _ => Task.CompletedTask;
+        registry ??= Substitute.For<IModelRegistry>();
+        if (healthStore is null)
+        {
+            var health = Substitute.For<IBackendHealthStore>();
+            health.IsBackendHealthy(Arg.Any<string>()).Returns(true);
+            health.IsBackendHealthy(Arg.Any<string>(), Arg.Any<string>()).Returns(true);
+            healthStore = health;
+        }
+
+        forwarder ??= Substitute.For<IInferenceHttpForwarder>();
+
+        var modelGrants = Substitute.For<IModelGrantService>();
+        modelGrants.IsModelAllowedAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(true);
+
+        scopeFactory ??= CreateGrantScopeFactory(modelGrants);
+        authState ??= CreateOpenAuthState();
+
+        errorWriter ??= new OpenAiErrorResponseWriter();
+        if (requestTracker is null)
+        {
+            // Only the default gets the throwaway-scope stub: re-stubbing a caller-supplied tracker
+            // would silently discard the scope a test set up to assert its outcome on.
+            var defaultTracker = Substitute.For<IRequestTracker>();
+            defaultTracker.BeginInferenceRequest(Arg.Any<string>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<MetricCaller>())
+                .Returns(_ => Substitute.For<IInferenceRequestScope>());
+            requestTracker = defaultTracker;
+        }
+
+        recentRequestStore ??= Substitute.For<IRecentRequestStore>();
+        var usageRecorder = Substitute.For<IUsageRecorder>();
+        var metricsCollector = Substitute.For<IGatewayMetricsCollector>();
+
+        var options = gatewayOptions ?? new GatewayOptions();
+        var gatewayOptionsWrapper = Options.Create(options);
+        circuitBreakers ??= new ModelCircuitBreakerRegistry(gatewayOptionsWrapper, metricsCollector);
+        bulkhead ??= new BulkheadRegistry(gatewayOptionsWrapper, metricsCollector);
+        IRateLimitPolicyResolver rateLimitResolver;
+        if (rateLimitPolicyResolver is null)
+        {
+            var defaultResolver = Substitute.For<IRateLimitPolicyResolver>();
+            defaultResolver.Resolve(Arg.Any<string?>(), Arg.Any<string?>(), Arg.Any<string?>())
+                .Returns(new RateLimitPolicy(10_000, 1_000, 1_000));
+            // Must be stubbed explicitly: an unconfigured substitute returns false, which would
+            // silently bypass the stream-slot path these tests exercise.
+            defaultResolver.IsEnabled().Returns(true);
+            rateLimitResolver = defaultResolver;
+        }
+        else
+        {
+            rateLimitResolver = rateLimitPolicyResolver;
+        }
+
+        if (rateLimitStore is null)
+        {
+            var defaultStore = Substitute.For<IDistributedRateLimitStore>();
+            defaultStore.TryAcquireStreamSlot(Arg.Any<string>(), Arg.Any<RateLimitPolicy>())
+                .Returns(new RateLimitAcquireResult(true));
+            rateLimitStore = defaultStore;
+        }
+
+        return new ModelRouterMiddleware(
+            next,
+            registry,
+            healthStore,
+            scopeFactory,
+            authState,
+            errorWriter,
+            requestTracker,
+            recentRequestStore,
+            usageRecorder,
+            metricsCollector,
+            circuitBreakers,
+            bulkhead,
+            rateLimitResolver,
+            rateLimitStore,
+            forwarder,
+            gatewayOptionsWrapper,
+            upstreamTokenResolver ?? Substitute.For<IUpstreamBearerTokenResolver>(),
+            budgetEnforcement ?? CreateAllowAllBudgetEnforcement(),
+            errorRecorder ?? Substitute.For<IGatewayErrorRecorder>(),
+            NullLogger<ModelRouterMiddleware>.Instance,
+            rateLimitPlanResolver: rateLimitPlanResolver,
+            rateLimitUsage: rateLimitUsage,
+            rateLimitGovernor: rateLimitGovernor);
+    }
+
+    private static IBudgetEnforcementService CreateAllowAllBudgetEnforcement()
+    {
+        var enforcement = Substitute.For<IBudgetEnforcementService>();
+        enforcement.CheckBeforeForwardAsync(Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(BudgetCheckResult.Allowed);
+        enforcement.TryReserveAsync(
+                Arg.Any<string?>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<long?>(), Arg.Any<long>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(BudgetCheckResult.Allowed);
+        return enforcement;
+    }
+
+    private static IServiceScopeFactory CreateGrantScopeFactory(IModelGrantService modelGrants)
+    {
+        var scopeFactory = Substitute.For<IServiceScopeFactory>();
+        var scope = Substitute.For<IServiceScope>();
+        var scopeProvider = Substitute.For<IServiceProvider>();
+        scopeFactory.CreateAsyncScope().Returns(scope);
+        scope.ServiceProvider.Returns(scopeProvider);
+        scopeProvider.GetService(typeof(IModelGrantService)).Returns(modelGrants);
+        return scopeFactory;
+    }
+
+    private static IGatewayAuthenticationState CreateOpenAuthState()
+    {
+        var authState = Substitute.For<IGatewayAuthenticationState>();
+        authState.IsAuthenticationRequired.Returns(false);
+        return authState;
+    }
+
+    private sealed class NoOpDisposable : IDisposable
+    {
+        public void Dispose()
+        {
+        }
+    }
+}

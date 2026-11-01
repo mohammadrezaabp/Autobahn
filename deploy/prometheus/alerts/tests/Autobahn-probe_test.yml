@@ -1,0 +1,90 @@
+# promtool test rules deploy/prometheus/alerts/tests/Autobahn-probe_test.yml
+rule_files:
+  - ../Autobahn-probe.yml
+
+evaluation_interval: 1m
+
+tests:
+  # The 2026-10-05 case: the listing works, one model answers 500 to the strict-tool request.
+  - name: one model failing its probe alerts for that model only
+    interval: 1m
+    input_series:
+      - series: 'gateway_probe_success{model="deepseek",kind="chat",origin="gpu1"}'
+        values: '1x5 0x20'
+      - series: 'gateway_probe_http_status{model="deepseek",kind="chat",origin="gpu1"}'
+        values: '200x5 500x20'
+      - series: 'gateway_probe_success{model="qwen3",kind="chat",origin="gpu1"}'
+        values: '1x25'
+      - series: 'gateway_probe_models_listed{origin="gpu1"}'
+        values: '1x25'
+      - series: 'gateway_probe_last_round_timestamp_seconds{origin="gpu1"}'
+        values: '0+60x25'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: GatewayProbeFailing
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: GatewayProbeFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              model: deepseek
+              kind: chat
+              origin: gpu1
+            exp_annotations:
+              summary: The chat probe for deepseek is failing
+              description: >-
+                The probe at gpu1 has had no correct answer from deepseek for 5 minutes. Last HTTP
+                status: 500 (0 means no answer).
+              runbook: docs/runbooks/high-error-rate.md#probe-failing
+      - eval_time: 12m
+        alertname: GatewayProbeCannotReachGateway
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: GatewayProbeStale
+        exp_alerts: []
+
+  - name: a probe on another host that cannot list models says the gateway is unreachable
+    interval: 1m
+    input_series:
+      - series: 'gateway_probe_models_listed{origin="gpu2"}'
+        values: '1x5 0x20'
+      - series: 'gateway_probe_last_round_timestamp_seconds{origin="gpu2"}'
+        values: '60+60x25'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: GatewayProbeCannotReachGateway
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              origin: gpu2
+            exp_annotations:
+              summary: The probe at gpu2 cannot reach the gateway
+              description: >-
+                GET /v1/models has failed from gpu2 for 3 minutes: the gateway is down,
+                unreachable from there, or refusing the probe's key.
+              runbook: docs/runbooks/all-backends-down.md
+
+  # The series is still served, but the round it describes ended long ago.
+  - name: a probe that stopped probing is reported
+    interval: 1m
+    input_series:
+      - series: 'gateway_probe_models_listed{origin="gpu1"}'
+        values: '1x30'
+      - series: 'gateway_probe_last_round_timestamp_seconds{origin="gpu1"}'
+        values: '0+60x5 300x25'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: GatewayProbeStale
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: GatewayProbeStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              origin: gpu1
+            exp_annotations:
+              summary: The probe at gpu1 has stopped probing
+              description: >-
+                The probe at gpu1 finished no round in the last 5 minutes, so its results are old.
+                Check the probe container or process.

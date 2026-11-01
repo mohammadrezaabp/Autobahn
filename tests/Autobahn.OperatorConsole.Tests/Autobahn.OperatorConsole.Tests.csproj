@@ -1,0 +1,5 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Autobahn.OperatorConsole\Autobahn.OperatorConsole.csproj" />
+  </ItemGroup>
+</Project>

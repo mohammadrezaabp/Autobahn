@@ -1,0 +1,62 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <AdminWebDir>$(MSBuildThisFileDirectory)..\Autobahn.Admin.Web\</AdminWebDir>
+    <SkipFrontendBuild Condition="'$(SkipFrontendBuild)' == ''">false</SkipFrontendBuild>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Serilog.AspNetCore" />
+    <PackageReference Include="Serilog.Settings.Configuration" />
+    <PackageReference Include="Serilog.Sinks.Console" />
+    <PackageReference Include="Serilog.Sinks.Async" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />
+    <PackageReference Include="OpenTelemetry.Exporter.Prometheus.AspNetCore" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Http" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Runtime" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Autobahn.Integration.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <!--
+      CopyToPublishDirectory="Never" is the point of this line. models.json is a development
+      fixture: two routes pointing at the gateway's own listen address, which answer their own
+      health probe and so certify themselves healthy forever. Publishing it made that fixture a
+      build artefact of the release image, so a fresh install came up with two fictional backends
+      and "nothing is configured" was indistinguishable from "configured and working".
+      It stays in the build output, where local runs and the test suite use it, and it is absent
+      from every `dotnet publish` — the container image and the release tarball both. A release
+      starts with an empty registry and says so.
+    -->
+    <None Include="..\..\config\models.json" Link="config/models.json"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Never" />
+    <None Include="..\..\config\models.ci.json" Link="config/models.ci.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Autobahn.Infrastructure/Autobahn.Infrastructure.csproj" />
+    <ProjectReference Include="..\Autobahn.Api\Autobahn.Api.csproj" />
+    <ProjectReference Include="..\Autobahn.Proxy\Autobahn.Proxy.csproj" />
+    <ProjectReference Include="..\Autobahn.Security\Autobahn.Security.csproj" />
+    <ProjectReference Include="..\Autobahn.Policy\Autobahn.Policy.csproj" />
+    <ProjectReference Include="..\Autobahn.Observability\Autobahn.Observability.csproj" />
+    <ProjectReference Include="..\Autobahn.Billing\Autobahn.Billing.csproj" />
+    <ProjectReference Include="..\Autobahn.Persistence\Autobahn.Persistence.csproj" />
+    <ProjectReference Include="..\Autobahn.Registry\Autobahn.Registry.csproj" />
+    <ProjectReference Include="..\Autobahn.OperatorConsole\Autobahn.OperatorConsole.csproj" />
+    <ProjectReference Include="..\Autobahn.Application\Autobahn.Application.csproj" />
+  </ItemGroup>
+  <!-- Admin frontend (Solid + Vite). Runs on Publish only; use -p:SkipFrontendBuild=true to skip. -->
+  <Target Name="BuildAdminFrontend" BeforeTargets="Publish" Condition="'$(SkipFrontendBuild)' != 'true'">
+    <Message Importance="high" Text="Building admin frontend (Autobahn.Admin.Web)..." />
+    <Exec WorkingDirectory="$(AdminWebDir)" Command="npm ci --ignore-scripts" />
+    <Exec WorkingDirectory="$(AdminWebDir)" Command="npm run build" />
+    <Exec WorkingDirectory="$(MSBuildThisFileDirectory)../Autobahn.Fleet.Web" Command="npm ci --ignore-scripts" />
+    <Exec WorkingDirectory="$(MSBuildThisFileDirectory)../Autobahn.Fleet.Web" Command="npm run build" />
+  </Target>
+</Project>

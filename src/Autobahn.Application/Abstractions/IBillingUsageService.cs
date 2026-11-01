@@ -1,0 +1,33 @@
+using Autobahn.Domain.Billing;
+using Autobahn.Domain.Models;
+
+namespace Autobahn.Application.Abstractions;
+
+public interface IBillingUsageService
+{
+    Task<UsageReportResponse> GetUsageReportAsync(
+        UsageReportRequest request,
+        CancellationToken cancellationToken = default);
+
+    UsageExportResult ExportRollups(
+        IReadOnlyList<DailyUsageRollupRecord> rollups,
+        string format);
+
+    /// <summary>
+    /// Ledger export. Rows are capped at <see cref="UsageExportLimits.MaxEventRows"/>; the result
+    /// says whether the cap was hit.
+    /// </summary>
+    Task<UsageExportResult> ExportEventsAsync(
+        BillingEventQuery query,
+        string format,
+        CancellationToken cancellationToken = default);
+
+    Task<BillingEventsPage> QueryEventsAsync(
+        BillingEventQuery query,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Each API key's share of the requests, tokens and cost matching <paramref name="query"/>.</summary>
+    Task<UsageKeySharesResponse> GetKeySharesAsync(
+        BillingEventQuery query,
+        CancellationToken cancellationToken = default);
+}

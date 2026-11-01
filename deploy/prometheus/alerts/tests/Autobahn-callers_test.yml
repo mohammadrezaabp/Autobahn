@@ -1,0 +1,185 @@
+# promtool test rules deploy/prometheus/alerts/tests/Autobahn-callers_test.yml
+#
+# The rules that name a caller or a limit: retry storm, noisy neighbour, model near ceiling, and
+# the list of failing callers on the breaker alert. Counters are `start+step x n` at one minute.
+rule_files:
+  - ../Autobahn.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: a key refused nine times in ten that keeps sending is a retry storm
+    interval: 1m
+    input_series:
+      - series: 'gateway_rate_limit_decisions_total{tenant="fanus",key="campaign",model="unknown",scope="none",control="rate",outcome="admitted"}'
+        values: '0+10x30'
+      - series: 'gateway_rate_limit_decisions_total{tenant="fanus",key="campaign",model="unknown",scope="api_key",control="rate",outcome="refused"}'
+        values: '0+90x30'
+      - series: 'gateway_rate_limit_decisions_total{tenant="easy",key="main",model="unknown",scope="none",control="rate",outcome="admitted"}'
+        values: '0+100x30'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: GatewayRetryStorm
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: GatewayRetryStorm
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              tenant: fanus
+              key: campaign
+              team: fanus
+            exp_annotations:
+              summary: Key campaign of tenant fanus keeps retrying into its limit
+              description: >-
+                90% of the rate-limit decisions for key campaign over the last 5 minutes were
+                refusals, and it has not slowed down. The client is retrying without honouring
+                Retry-After.
+              runbook: docs/runbooks/rate-limit-admin.md#retry-storm
+
+  # Refused just as often, but sending less every minute: the client is backing off.
+  - name: a key that is slowing down is not a retry storm
+    interval: 1m
+    input_series:
+      - series: 'gateway_rate_limit_decisions_total{tenant="fanus",key="campaign",model="unknown",scope="none",control="rate",outcome="admitted"}'
+        values: '0 20 38 54 68 80 90 98 104 108 110 111 112 113 114 115 116 117 118 119 120'
+      - series: 'gateway_rate_limit_decisions_total{tenant="fanus",key="campaign",model="unknown",scope="api_key",control="rate",outcome="refused"}'
+        values: '0 180 342 486 612 720 810 882 936 972 990 999 1008 1017 1026 1035 1044 1053 1062 1071 1080'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: GatewayRetryStorm
+        exp_alerts: []
+
+  - name: one key with most of a model while another tenant is refused is a noisy neighbour
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="bge-m3",status="success",tenant="fanus",key="campaign"}'
+        values: '0+140x30'
+      - series: 'gateway_inference_requests_total{model="bge-m3",status="success",tenant="easy",key="main"}'
+        values: '0+60x30'
+      - series: 'gateway_rate_limit_decisions_total{tenant="easy",key="main",model="unknown",scope="tenant",control="rate",outcome="refused"}'
+        values: '0+5x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayNoisyNeighbour
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              model: bge-m3
+              tenant: fanus
+              key: campaign
+            exp_annotations:
+              summary: Key campaign dominates bge-m3 while another tenant is refused
+              description: >-
+                Key campaign of tenant fanus sent 70% of the requests to bge-m3 over the last 5
+                minutes, and at least one other tenant is being rate limited.
+              runbook: docs/runbooks/rate-limit-admin.md#noisy-neighbour
+
+  # The busy key's own tenant is the only one refused: that is GatewayTenantThrottled's case.
+  - name: a busy key refused only itself is not a noisy neighbour
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="bge-m3",status="success",tenant="fanus",key="campaign"}'
+        values: '0+140x30'
+      - series: 'gateway_inference_requests_total{model="bge-m3",status="success",tenant="easy",key="main"}'
+        values: '0+60x30'
+      - series: 'gateway_rate_limit_decisions_total{tenant="fanus",key="campaign",model="unknown",scope="tenant",control="rate",outcome="refused"}'
+        values: '0+5x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayNoisyNeighbour
+        exp_alerts: []
+
+  - name: a busy key refused together with another tenant is a noisy neighbour
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="bge-m3",status="success",tenant="fanus",key="campaign"}'
+        values: '0+140x30'
+      - series: 'gateway_inference_requests_total{model="bge-m3",status="success",tenant="easy",key="main"}'
+        values: '0+60x30'
+      - series: 'gateway_rate_limit_decisions_total{tenant="fanus",key="campaign",model="unknown",scope="tenant",control="rate",outcome="refused"}'
+        values: '0+5x30'
+      - series: 'gateway_rate_limit_decisions_total{tenant="easy",key="main",model="unknown",scope="global",control="rate",outcome="refused"}'
+        values: '0+5x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayNoisyNeighbour
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              model: bge-m3
+              tenant: fanus
+              key: campaign
+            exp_annotations:
+              summary: Key campaign dominates bge-m3 while another tenant is refused
+              description: >-
+                Key campaign of tenant fanus sent 70% of the requests to bge-m3 over the last 5
+                minutes, and at least one other tenant is being rate limited.
+              runbook: docs/runbooks/rate-limit-admin.md#noisy-neighbour
+
+  - name: nobody refused means no noisy neighbour, whatever the shares
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="bge-m3",status="success",tenant="fanus",key="campaign"}'
+        values: '0+140x30'
+      - series: 'gateway_inference_requests_total{model="bge-m3",status="success",tenant="easy",key="main"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayNoisyNeighbour
+        exp_alerts: []
+
+  - name: a model rule above 85 percent for 15 minutes goes to the capacity owner
+    interval: 1m
+    input_series:
+      - series: 'gateway_rate_limit_utilization_ratio{limit_id="model:qwen3"}'
+        values: '0.9x30'
+      - series: 'gateway_rate_limit_utilization_ratio{limit_id="model:bge-m3"}'
+        values: '0.5x30'
+      # A key's own rule near its rate is that key's business, not the model's ceiling.
+      - series: 'gateway_rate_limit_utilization_ratio{limit_id="api_key:0b6f"}'
+        values: '0.99x30'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: GatewayModelNearCeiling
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: GatewayModelNearCeiling
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              team: capacity
+              limit_id: model:qwen3
+            exp_annotations:
+              summary: model:qwen3 is above 85% of its rate limit
+              description: >-
+                Requests admitted under model:qwen3 have averaged 90% of its configured rate for 15
+                minutes. Past 100% every caller of the model is refused.
+              runbook: docs/runbooks/rate-limit-admin.md#model-near-ceiling
+
+  - name: an open breaker lists whose requests failed
+    interval: 1m
+    input_series:
+      - series: 'gateway_circuit_breaker_state{model="qwen3"}'
+        values: '2x20'
+      - series: 'gateway_inference_errors_total{model="qwen3",code="upstream_timeout",tenant="easy",key="main"}'
+        values: '0+3x20'
+      - series: 'gateway_inference_errors_total{model="qwen3",code="upstream_5xx",tenant="fanus",key="campaign"}'
+        values: '0+1x20'
+      # Not a backend failure, so not in the list.
+      - series: 'gateway_inference_errors_total{model="qwen3",code="circuit_open",tenant="fanus",key="campaign"}'
+        values: '0+50x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayCircuitBreakerOpen
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              model: qwen3
+            exp_annotations:
+              summary: Circuit breaker open for qwen3
+              runbook: docs/runbooks/high-error-rate.md#circuit-breaker-open
+              description: >-
+                The gateway is answering circuit_open for qwen3 without forwarding.
+                Backend failures by caller over the last 10 minutes:
+                easy/main 75%; fanus/campaign 25%

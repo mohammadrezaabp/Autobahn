@@ -1,0 +1,41 @@
+using Autobahn.Application.Abstractions;
+
+namespace Autobahn.Registry.Tests.Services;
+
+internal sealed class TestUpstreamSecretStore : IUpstreamSecretStore
+{
+    private readonly Dictionary<string, string> _secrets = new(StringComparer.OrdinalIgnoreCase);
+
+    public bool TryGet(string modelId, out string? secret) =>
+        _secrets.TryGetValue(modelId.Trim(), out secret);
+
+    public Task PutAsync(string modelId, string secret, CancellationToken cancellationToken = default)
+    {
+        _secrets[modelId.Trim()] = secret;
+        return Task.CompletedTask;
+    }
+
+    public Task DeleteAsync(string modelId, CancellationToken cancellationToken = default)
+    {
+        _secrets.Remove(modelId.Trim());
+        return Task.CompletedTask;
+    }
+
+    public Task<bool> ExistsAsync(string modelId, CancellationToken cancellationToken = default) =>
+        Task.FromResult(_secrets.ContainsKey(modelId.Trim()));
+
+    public Task<IReadOnlySet<string>> ListExistingAsync(
+        IEnumerable<string> modelIds,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var present = modelIds
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Select(id => id.Trim())
+            .Where(_secrets.ContainsKey)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        return Task.FromResult<IReadOnlySet<string>>(present);
+    }
+}

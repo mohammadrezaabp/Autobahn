@@ -1,0 +1,7 @@
+/* Component foundations sit below the gateway's shared workspace theme. */
+@import url('../../../../Autobahn.Fleet.Web/src/styles.css') layer(fleet);
+
+.ab-fleet-workspace { min-width: 0; }
+.ab-fleet-workspace > .page-header { margin-bottom: 24px; }
+.ab-fleet-workspace .signin { margin: 0; }
+.ab-fleet-workspace .alert { margin-bottom: 20px; }

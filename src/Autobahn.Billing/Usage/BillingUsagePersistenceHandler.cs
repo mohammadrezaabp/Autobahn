@@ -1,0 +1,587 @@
+using Microsoft.Extensions.Logging;
+using Autobahn.Application.Abstractions;
+using Autobahn.Domain.Billing;
+using Autobahn.Billing.RateCards;
+using Autobahn.Domain.Models;
+using Autobahn.Application.Usage;
+
+namespace Autobahn.Billing.Usage;
+
+public sealed class BillingUsagePersistenceHandler(
+    IBillingEventRepository billingEvents,
+    IDailyUsageRollupRepository rollups,
+    IRateCardRepository rateCards,
+    IRateCardCostCalculator costCalculator,
+    IBudgetRepository budgets,
+    IBillingWebhookDispatcher webhooks,
+    BillingBudgetWarningTracker warningTracker,
+    BillingUnpricedModelTracker unpricedModelTracker,
+    IApiKeyLastUsedTracker lastUsedTracker,
+    BudgetReservationLedger reservationLedger,
+    ILogger<BillingUsagePersistenceHandler> logger,
+    // Optional so the handler still composes without the observability layer (unit tests, tools).
+    // When present, every priced event is echoed to the console's live feed.
+    IRecentRequestStore? recentRequests = null,
+    // Optional for the same reason; when present, a tenant's cached period spend is discarded once
+    // a batch's spend has reached the rollups, before its reservations are released.
+    BudgetSpendCache? spendCache = null,
+    // Optional. When present, each newly persisted priced event increments the billed-cost counter
+    // under the tenant slug (never the id, and never an API key).
+    IGatewayMetricsCollector? metrics = null,
+    ITenantRepository? tenants = null,
+    // Optional. When present, what each request cost at a paid provider is added to that
+    // provider's spend table, which is what the monthly caps are held against.
+    IProviderSpendRepository? providerSpend = null,
+    IProviderSpendCapService? spendCaps = null,
+    // Optional. When absent, every request is priced at its model's rate card whatever the hour.
+    PeakPricingPolicy? peakPricing = null) : IUsagePersistenceHandler
+{
+    private readonly PeakPricingPolicy _peakPricing = peakPricing ?? PeakPricingPolicy.None;
+
+    public async ValueTask PersistAsync(UsageEvent usageEvent, CancellationToken cancellationToken = default)
+    {
+        await PersistBatchAsync([usageEvent], cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Persists a whole batch with a per-batch, not per-event, database cost: rate cards are fetched
+    /// once, rollup changes are grouped into one atomic increment per bucket, api-key touches are
+    /// deduplicated per key, and budget warnings are evaluated once per tenant.
+    /// </summary>
+    /// <remarks>
+    /// This method previously looped calling a single-event path, so a batch of 100 issued roughly
+    /// 600 round-trips: a rate-card lookup, an append, a last-used touch, a rollup read, a rollup
+    /// write and a budget-warning scan for every event.
+    /// </remarks>
+    public async Task PersistBatchAsync(
+        IReadOnlyList<UsageEvent> usageEvents,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(usageEvents);
+        if (usageEvents.Count == 0)
+        {
+            return;
+        }
+
+        var pricedByModel = await ResolveRateCardsAsync(usageEvents, cancellationToken).ConfigureAwait(false);
+
+        // Each event still becomes its own billing_events row: that is the audit trail, and its
+        // per-request detail (request id, duration, per-event cost) must not be aggregated away.
+        // They are written as one batch — one existence probe and one transaction — rather than one
+        // SaveChanges per event, which had turned a 100-event batch into 200 round trips and 100
+        // separate WAL commits and made the usage writer the slowest stage in the process.
+        var records = new List<BillingEventRecord>(usageEvents.Count);
+        foreach (var usageEvent in usageEvents)
+        {
+            records.Add(BillingEventFactory.FromUsageEvent(usageEvent, PriceEvent(usageEvent, pricedByModel)));
+        }
+
+        var appended = await AppendAsync(records, cancellationToken).ConfigureAwait(false);
+
+        // Priced now, and the write is behind us: tell the live feed. Duplicates included — the same
+        // request id was already stored at this cost, and the operator's row should not sit on
+        // "pending" because a retry happened to flush first.
+        PublishToLiveFeed(usageEvents, records, pricedByModel);
+        if (appended.Count != records.Count)
+        {
+            // Duplicates: the cost was already persisted for those requests, so free their
+            // reservations and keep them out of the rollup aggregation.
+            var appendedIds = new HashSet<string>(appended.Select(r => r.RequestId), StringComparer.Ordinal);
+            foreach (var record in records)
+            {
+                if (!appendedIds.Contains(record.RequestId))
+                {
+                    reservationLedger.Release(record.RequestId);
+                    spendCaps?.Release(record.RequestId);
+                }
+            }
+        }
+
+        if (appended.Count == 0)
+        {
+            return;
+        }
+
+        // Best-effort. The rows are already committed; a slug lookup or collector failure must not
+        // skip the rollup. A thrown error here is retried as a duplicate, the retry appends nothing,
+        // and the batch returns success with the spend missing from daily_usage_rollups.
+        await RecordBilledCostsAsync(usageEvents, records, appended, cancellationToken).ConfigureAwait(false);
+
+        // Before anything that can throw: the rows are committed, and a retry of this batch
+        // appends nothing and so would never reach this line again.
+        await RecordProviderSpendAsync(appended, cancellationToken).ConfigureAwait(false);
+
+        // One touch per distinct api key, using its latest timestamp in this batch.
+        foreach (var group in appended
+                     .Where(r => r.ApiKeyId is not null)
+                     .GroupBy(r => r.ApiKeyId!.Value))
+        {
+            await lastUsedTracker
+                .TouchAsync(group.Key, group.Max(r => r.RecordedAt), cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        // One additive delta per (day, tenant, model, cost centre) bucket, applied atomically. The
+        // old read-add-write of an absolute total could lose a concurrent writer's usage entirely.
+        var deltas = appended
+            .GroupBy(DailyUsageRollupKey.FromEvent)
+            .Select(group => new DailyUsageRollupDelta(
+                group.Key.UsageDate,
+                group.Key.TenantId,
+                group.Key.ModelId,
+                group.Key.CostCenter,
+                group.Sum(r => r.PromptTokens),
+                group.Sum(r => r.CompletionTokens),
+                group.Sum(r => r.TotalCost ?? 0m),
+                group.Count()))
+            .ToList();
+
+        try
+        {
+            await rollups.IncrementRollupsAsync(deltas, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The billing_events rows are already committed but their spend never reached the
+            // rollups, so budgets will under-count these requests permanently. Surface that
+            // explicitly rather than letting the caller's catch-all log it as a generic failure —
+            // and still release the reservations, which would otherwise sit until their TTL.
+            logger.LogError(
+                ex,
+                "Rollup increment failed for {EventCount} persisted billing event(s) across {BucketCount} "
+                + "bucket(s). Their spend is recorded in billing_events but is NOT reflected in "
+                + "daily_usage_rollups, so budget and quota totals will under-count until the rollups "
+                + "are rebuilt from billing_events.",
+                appended.Count,
+                deltas.Count);
+
+            ReleaseReservations(appended);
+            throw;
+        }
+
+        var tenantIds = appended
+            .Where(r => r.TenantId is not null)
+            .Select(r => r.TenantId!.Value)
+            .Distinct()
+            .ToList();
+
+        // Actual cost is now in the rollups. Budget enforcement caches persisted spend briefly, so
+        // that cache must be invalidated for every affected tenant BEFORE the reservations are
+        // released: otherwise, until the cached figure expired, the batch's cost was held by neither
+        // the ledger nor the cache and concurrent requests were admitted against overstated headroom.
+        InvalidateSpendCache(tenantIds);
+        ReleaseReservations(appended);
+
+        foreach (var tenantId in tenantIds)
+        {
+            await CheckBudgetWarningsAsync(tenantId, cancellationToken).ConfigureAwait(false);
+        }
+
+        // The daily usage summary is NOT dispatched here. It is owned by
+        // DailyUsageWebhookPublisher, which runs after the day closes and reports the day's totals.
+        // Firing it inline sent a "daily" summary containing whatever had accrued by a tenant's
+        // first request of the day — and, because both paths share the same dedup tracker, that
+        // send consumed the tracker slot so the real end-of-day summary was never delivered at all.
+    }
+
+    private void PublishToLiveFeed(
+        IReadOnlyList<UsageEvent> usageEvents,
+        IReadOnlyList<BillingEventRecord> records,
+        Dictionary<string, RateCardRecord?> pricedByModel)
+    {
+        if (recentRequests is null)
+        {
+            return;
+        }
+
+        for (var i = 0; i < records.Count; i++)
+        {
+            var record = records[i];
+            var source = usageEvents[i];
+            var currency = pricedByModel.TryGetValue(source.ModelId, out var rateCard) ? rateCard?.Currency : null;
+            recentRequests.AttachUsage(record.RequestId, RecentRequestUsageMapper.FromBillingEvent(record, source, currency));
+        }
+    }
+
+    private async Task<IReadOnlyList<BillingEventRecord>> AppendAsync(
+        IReadOnlyList<BillingEventRecord> records,
+        CancellationToken cancellationToken)
+    {
+        if (billingEvents is IBillingEventBatchAppender batchAppender)
+        {
+            return await batchAppender.TryAppendManyAsync(records, cancellationToken).ConfigureAwait(false);
+        }
+
+        var appended = new List<BillingEventRecord>(records.Count);
+        foreach (var record in records)
+        {
+            if (await billingEvents.TryAppendAsync(record, cancellationToken).ConfigureAwait(false))
+            {
+                appended.Add(record);
+            }
+        }
+
+        return appended;
+    }
+
+    private async Task RecordBilledCostsAsync(
+        IReadOnlyList<UsageEvent> usageEvents,
+        IReadOnlyList<BillingEventRecord> records,
+        IReadOnlyList<BillingEventRecord> appended,
+        CancellationToken cancellationToken)
+    {
+        if (metrics is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var appendedIds = new HashSet<string>(appended.Select(r => r.RequestId), StringComparer.Ordinal);
+            var slugs = new Dictionary<Guid, string>();
+            if (tenants is not null)
+            {
+                foreach (var id in appended.Where(r => r.TenantId is not null).Select(r => r.TenantId!.Value).Distinct())
+                {
+                    try
+                    {
+                        var tenant = await tenants.GetByIdAsync(id, cancellationToken).ConfigureAwait(false);
+                        if (tenant is not null && !string.IsNullOrWhiteSpace(tenant.Slug))
+                        {
+                            slugs[id] = tenant.Slug;
+                        }
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(
+                            ex,
+                            "Tenant slug lookup failed for {TenantId}. Billed cost for this batch uses the unknown tenant label.",
+                            id);
+                    }
+                }
+            }
+
+            for (var i = 0; i < records.Count; i++)
+            {
+                var record = records[i];
+                if (!appendedIds.Contains(record.RequestId) || record.TotalCost is not > 0)
+                {
+                    continue;
+                }
+
+                var usage = usageEvents[i];
+                string tenantSlug;
+                if (string.IsNullOrWhiteSpace(usage.TenantId))
+                {
+                    tenantSlug = BillingMetricLabels.AnonymousTenant;
+                }
+                else if (record.TenantId is { } id && slugs.TryGetValue(id, out var slug))
+                {
+                    tenantSlug = slug;
+                }
+                else
+                {
+                    tenantSlug = BillingMetricLabels.UnknownTenant;
+                }
+
+                var costCenter = string.IsNullOrWhiteSpace(record.CostCenter)
+                    ? BillingMetricLabels.NoCostCenter
+                    : record.CostCenter;
+                metrics.RecordBilledCost(
+                    tenantSlug,
+                    record.ModelId,
+                    costCenter,
+                    (double)record.TotalCost.Value,
+                    record.Provider ?? ModelProviders.SelfHosted);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(
+                ex,
+                "Billed-cost metrics were not recorded for {EventCount} persisted event(s). "
+                + "The ledger rows are already stored and rollups will still be updated.",
+                appended.Count);
+        }
+    }
+
+    /// <summary>
+    /// Adds the batch's paid-provider cost to the spend table, then lets go of the reservations
+    /// those requests held against their caps.
+    /// </summary>
+    /// <remarks>
+    /// The order is the one budgets use: the cost is written, the cached figure is discarded, and
+    /// only then is the reservation released. A failure to write is logged and the reservations
+    /// are released anyway; the ledger row exists, so the spend can be rebuilt from it, and a
+    /// reservation that outlives its request would refuse callers for something already paid for.
+    /// </remarks>
+    private async Task RecordProviderSpendAsync(
+        IReadOnlyList<BillingEventRecord> appended,
+        CancellationToken cancellationToken)
+    {
+        var paid = appended
+            .Where(r => !string.IsNullOrWhiteSpace(r.Provider) && ModelProviders.IsPaid(r.Provider!))
+            .ToList();
+        if (paid.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            if (providerSpend is not null)
+            {
+                var deltas = paid
+                    .GroupBy(r => (
+                        Date: DateOnly.FromDateTime(r.RecordedAt.UtcDateTime),
+                        r.TenantId,
+                        r.ApiKeyId,
+                        Provider: r.Provider!.ToLowerInvariant(),
+                        Model: r.ModelId))
+                    .Select(g => new ProviderSpendDelta(
+                        g.Key.Date,
+                        g.Key.TenantId,
+                        g.Key.ApiKeyId,
+                        g.Key.Provider,
+                        g.Key.Model,
+                        g.Sum(r => r.TotalCost ?? 0m),
+                        g.Count()))
+                    .ToList();
+
+                await providerSpend.IncrementAsync(deltas, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogError(
+                ex,
+                "Provider spend was not recorded for {EventCount} persisted event(s). The ledger rows are stored; "
+                + "the monthly caps will under-count until provider_spend_daily is rebuilt from billing_events.",
+                paid.Count);
+        }
+        finally
+        {
+            if (spendCaps is not null)
+            {
+                foreach (var group in paid.Where(r => r.TenantId is not null).GroupBy(r => (r.TenantId, r.Provider)))
+                {
+                    spendCaps.Invalidate(group.Key.TenantId!.Value, group.Key.Provider!);
+                }
+
+                foreach (var record in paid)
+                {
+                    spendCaps.Release(record.RequestId);
+                }
+            }
+        }
+
+        if (metrics is not null)
+        {
+            foreach (var group in paid.GroupBy(r => r.Provider!.ToLowerInvariant()))
+            {
+                metrics.RecordProviderSpend(group.Key, (double)group.Sum(r => r.TotalCost ?? 0m), group.Count());
+            }
+        }
+    }
+
+    private void InvalidateSpendCache(IReadOnlyList<Guid> tenantIds)
+    {
+        if (spendCache is null)
+        {
+            return;
+        }
+
+        foreach (var tenantId in tenantIds)
+        {
+            spendCache.Invalidate(tenantId);
+        }
+    }
+
+    private void ReleaseReservations(IReadOnlyList<BillingEventRecord> appended)
+    {
+        foreach (var record in appended)
+        {
+            reservationLedger.Release(record.RequestId);
+        }
+    }
+
+    /// <summary>
+    /// Fetches the active rate card for every distinct model in the batch, once each, and warns once
+    /// per unpriced model.
+    /// </summary>
+    private async Task<Dictionary<string, RateCardRecord?>> ResolveRateCardsAsync(
+        IReadOnlyList<UsageEvent> usageEvents,
+        CancellationToken cancellationToken)
+    {
+        var byModel = new Dictionary<string, RateCardRecord?>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var usageEvent in usageEvents)
+        {
+            if (string.IsNullOrWhiteSpace(usageEvent.ModelId) || byModel.ContainsKey(usageEvent.ModelId))
+            {
+                continue;
+            }
+
+            var atUtc = usageEvent.TimestampUtc == default ? DateTimeOffset.UtcNow : usageEvent.TimestampUtc;
+            var rateCard = await rateCards
+                .GetActiveForModelAsync(usageEvent.ModelId, atUtc, cancellationToken)
+                .ConfigureAwait(false);
+
+            byModel[usageEvent.ModelId] = rateCard;
+
+            if (rateCard is not null)
+            {
+                unpricedModelTracker.Clear(usageEvent.ModelId);
+            }
+            else if (unpricedModelTracker.TryMarkWarned(usageEvent.ModelId))
+            {
+                // Without a rate card the event persists with null costs and rolls up as zero
+                // spend, which is indistinguishable from genuinely free usage. Say so once.
+                logger.LogWarning(
+                    "Model '{ModelId}' has no rate card; its usage will record as zero cost. " +
+                    "Set input/output prices for it in the admin model settings.",
+                    usageEvent.ModelId);
+            }
+        }
+
+        return byModel;
+    }
+
+    /// <remarks>
+    /// What the upstream says it charged comes first. It is the amount on the provider's invoice:
+    /// it already reflects cached tokens, the route the provider picked and prices that are not
+    /// per token, none of which a hand-kept price can follow. The model's price is the fallback
+    /// for a response that carries no cost.
+    /// </remarks>
+    private BillingCostBreakdown? PriceEvent(
+        UsageEvent usageEvent,
+        Dictionary<string, RateCardRecord?> pricedByModel)
+    {
+        if (usageEvent.ReportedCost is { } reported)
+        {
+            // The upstream reports one figure, not a split; it is carried on the output side, as
+            // an unsplit token total is.
+            var cost = decimal.Round(reported, RateCardCostCalculator.CostScale);
+            return new BillingCostBreakdown(0m, cost, cost, "USD");
+        }
+
+        if (string.IsNullOrWhiteSpace(usageEvent.ModelId) ||
+            !pricedByModel.TryGetValue(usageEvent.ModelId, out var rateCard) ||
+            rateCard is null)
+        {
+            return null;
+        }
+
+        // At the provider's peak hours the card's token prices are multiplied. Read from when the
+        // request started, which is the time the ledger can give back to a reprice as well.
+        var recordedAt = usageEvent.TimestampUtc == default ? DateTimeOffset.UtcNow : usageEvent.TimestampUtc;
+        rateCard = _peakPricing.Apply(
+            rateCard,
+            usageEvent.Provider,
+            PeakPricingPolicy.StartOf(recordedAt, usageEvent.DurationMs));
+
+        WarnOfUnpricedTokens(usageEvent, rateCard);
+
+        // Total-only usage carries no input/output split, so it cannot be priced with the per-side
+        // rates; the calculator applies the conservative (dearer-rate) policy.
+        return usageEvent.TokenSource == UsageTokenSource.TotalOnly
+            ? costCalculator.CalculateFromTotalTokens(rateCard, usageEvent.TotalTokens)
+            : costCalculator.Calculate(
+                rateCard,
+                usageEvent.PromptTokens,
+                usageEvent.CompletionTokens,
+                usageEvent.CachedPromptTokens);
+    }
+
+    /// <summary>
+    /// Says once per model when a request carried tokens its price has no rate for, so they were
+    /// priced as ordinary tokens: cached input at the full input price (over-billed, as DeepSeek's
+    /// was before its card held a cached price), audio as text (under-billed).
+    /// </summary>
+    private void WarnOfUnpricedTokens(UsageEvent usageEvent, RateCardRecord rateCard)
+    {
+        if (usageEvent.CachedPromptTokens > 0 &&
+            rateCard.CachedInputPricePerMillionTokens is null &&
+            unpricedModelTracker.TryMarkWarned(UnpricedKey("cached", usageEvent.ModelId)))
+        {
+            logger.LogWarning(
+                "Model '{ModelId}' served cached prompt tokens but its price has no cached-input rate; " +
+                "they are billed at the full input price. Set the cached-input price in the admin model settings.",
+                usageEvent.ModelId);
+        }
+
+        if (usageEvent.AudioTokens > 0 &&
+            unpricedModelTracker.TryMarkWarned(UnpricedKey("audio", usageEvent.ModelId)))
+        {
+            logger.LogWarning(
+                "Model '{ModelId}' reported audio tokens; a model's price has no audio rate, so they are billed " +
+                "as text tokens and the recorded cost is lower than the provider's charge.",
+                usageEvent.ModelId);
+        }
+    }
+
+    private static string UnpricedKey(string kind, string modelId) => $"{kind}:{modelId}";
+
+    private async Task CheckBudgetWarningsAsync(Guid tenantId, CancellationToken cancellationToken)
+    {
+        var tenantBudgets = await budgets.GetByTenantAsync(tenantId, cancellationToken).ConfigureAwait(false);
+        if (tenantBudgets.Count == 0)
+        {
+            return;
+        }
+
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        foreach (var budget in tenantBudgets)
+        {
+            var periodStart = GetPeriodStart(today, budget.PeriodStartDay);
+            var periodRollups = await rollups
+                .GetRollupsAsync(periodStart, today, tenantId, cancellationToken)
+                .ConfigureAwait(false);
+
+            var spend = periodRollups.Sum(r => r.TotalCost);
+            var warnAt = budget.AmountLimit * budget.WarningThresholdRatio;
+            if (spend < warnAt)
+            {
+                continue;
+            }
+
+            var key = $"{tenantId:N}:{budget.Id:N}:{periodStart:yyyy-MM-dd}";
+            if (!warningTracker.TryMarkSent(key))
+            {
+                continue;
+            }
+
+            // Release the once-per-period reservation if delivery never succeeds, so a transient
+            // receiver outage does not permanently swallow this period's warning.
+            await webhooks.DispatchAsync(
+                "quota.warning",
+                new
+                {
+                    tenantId,
+                    budgetId = budget.Id,
+                    budgetName = budget.Name,
+                    spend,
+                    limit = budget.AmountLimit,
+                    currency = budget.Currency,
+                    periodStart = periodStart.ToString("O"),
+                },
+                onPermanentFailure: () => warningTracker.Release(key),
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    public static DateOnly GetPeriodStart(DateOnly today, int periodStartDay)
+    {
+        var day = Math.Clamp(periodStartDay, 1, 28);
+        var candidate = new DateOnly(today.Year, today.Month, Math.Min(day, DateTime.DaysInMonth(today.Year, today.Month)));
+        return candidate > today ? candidate.AddMonths(-1) : candidate;
+    }
+}

@@ -1,0 +1,126 @@
+using System.Text;
+using Microsoft.AspNetCore.Http;
+using NSubstitute;
+using Autobahn.Application.Abstractions;
+using Autobahn.Domain.Models;
+using Autobahn.Proxy.Middleware;
+using Autobahn.Proxy.Parsing;
+
+namespace Autobahn.Proxy.Tests.Middleware;
+
+public sealed class PublicModelDetectionMiddlewareTests
+{
+    [Fact]
+    public async Task InvokeAsync_PublicModel_SetsContextItemsAndRewindsBody()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("alias", out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = new ModelConfig
+                {
+                    Id = "canonical",
+                    Url = "http://backend",
+                    PublicAccess = true,
+                    Aliases = ["alias"],
+                };
+                return true;
+            });
+        registry.GetAllModels().Returns([new ModelConfig { Id = "canonical", Url = "http://backend", PublicAccess = true }]);
+
+        var nextCalled = false;
+        var middleware = new PublicModelDetectionMiddleware(
+            ctx =>
+            {
+                nextCalled = true;
+                ctx.Request.Body.Position.Should().Be(0);
+                return Task.CompletedTask;
+            },
+            registry);
+
+        var context = CreatePostContext("""{"model":"alias","stream":false}""");
+
+        await middleware.InvokeAsync(context);
+
+        nextCalled.Should().BeTrue();
+        context.Items[PublicModelAccessKeys.IsPublicInference].Should().Be(true);
+        context.Items[PublicModelAccessKeys.CanonicalModelId].Should().Be("canonical");
+    }
+
+    [Fact]
+    public async Task InvokeAsync_PrivateModel_DoesNotSetItems()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("m1", out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = new ModelConfig { Id = "m1", Url = "http://backend" };
+                return true;
+            });
+
+        var middleware = new PublicModelDetectionMiddleware(_ => Task.CompletedTask, registry);
+        var context = CreatePostContext("""{"model":"m1"}""");
+
+        await middleware.InvokeAsync(context);
+
+        context.Items.ContainsKey(PublicModelAccessKeys.IsPublicInference).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task InvokeAsync_NoPublicModelsRegistered_DoesNotReadBodyOrCacheParse()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.GetAllModels().Returns([new ModelConfig { Id = "m1", Url = "http://backend" }]);
+
+        var middleware = new PublicModelDetectionMiddleware(_ => Task.CompletedTask, registry);
+        var context = CreatePostContext("""{"model":"m1"}""");
+        var body = new ThrowOnReadStream();
+        context.Request.Body = body;
+
+        await middleware.InvokeAsync(context);
+
+        registry.DidNotReceive().TryGetModel(Arg.Any<string>(), out Arg.Any<ModelConfig?>());
+        InferenceRequestParseCache.TryGet(context, out _).Should().BeFalse();
+        context.Items.ContainsKey(PublicModelAccessKeys.CanonicalModelId).Should().BeFalse();
+    }
+
+    private sealed class ThrowOnReadStream : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => 0; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new InvalidOperationException("body must not be read");
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) => throw new InvalidOperationException("body must not be read");
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) => throw new InvalidOperationException("body must not be read");
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    [Fact]
+    public async Task InvokeAsync_GetRequest_SkipsDetection()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        var middleware = new PublicModelDetectionMiddleware(_ => Task.CompletedTask, registry);
+        var context = new DefaultHttpContext();
+        context.Request.Method = HttpMethods.Get;
+        context.Request.Path = "/v1/chat/completions";
+
+        await middleware.InvokeAsync(context);
+
+        registry.DidNotReceive().TryGetModel(Arg.Any<string>(), out Arg.Any<ModelConfig?>());
+    }
+
+    private static DefaultHttpContext CreatePostContext(string body)
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = HttpMethods.Post;
+        context.Request.Path = "/v1/chat/completions";
+        context.Request.Body = new MemoryStream(Encoding.UTF8.GetBytes(body));
+        context.Request.ContentType = "application/json";
+        return context;
+    }
+}

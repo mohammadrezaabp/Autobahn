@@ -1,0 +1,280 @@
+# promtool test rules deploy/prometheus/alerts/tests/Autobahn-slo_test.yml
+#
+# The service-level rules (availability burn, time to first token), the gateway-wide error rate
+# and the two that report what the process did (restart, configuration change).
+rule_files:
+  - ../Autobahn.yml
+
+evaluation_interval: 1m
+
+tests:
+  # 100 requests a minute, 10 of them errors, 8 of those failures. The description names what
+  # failed, most frequent first, and the caller's own two errors are in neither figure.
+  - name: failing requests across the gateway name the models and codes behind them
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="qwen3",status="success",tenant="easy",key="main"}'
+        values: '0+90x30'
+      - series: 'gateway_inference_requests_total{model="qwen3",status="error",tenant="easy",key="main"}'
+        values: '0+10x30'
+      - series: 'gateway_inference_errors_total{model="qwen3",code="upstream_5xx",tenant="easy",key="main"}'
+        values: '0+8x30'
+      - series: 'gateway_inference_errors_total{model="qwen3",code="upstream_4xx",tenant="fanus",key="campaign"}'
+        values: '0+2x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayHighErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: More than 5% of all inference requests are failing
+              description: >-
+                8% of the inference requests over the last 5 minutes ended in a gateway or upstream
+                failure. Most frequent, by count: qwen3 upstream_5xx 40
+              runbook: docs/runbooks/high-error-rate.md
+
+  # One key asking for a model it has no grant on, a third of all requests, and nothing broken.
+  - name: errors that are the caller's own are not a high error rate
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="qwen3",status="success",tenant="easy",key="main"}'
+        values: '0+63x30'
+      - series: 'gateway_inference_requests_total{model="gemma",status="error",tenant="personal-keys",key="balance"}'
+        values: '0+37x30'
+      - series: 'gateway_inference_errors_total{model="gemma",code="insufficient_scope",tenant="personal-keys",key="balance"}'
+        values: '0+35x30'
+      - series: 'gateway_inference_errors_total{model="gemma",code="upstream_4xx",tenant="personal-keys",key="balance"}'
+        values: '0+1x30'
+      - series: 'gateway_inference_errors_total{model="gemma",code="model_stopped",tenant="personal-keys",key="balance"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayHighErrorRate
+        exp_alerts: []
+
+  # Two failures in five requests is 40%, and five requests in five minutes is nobody's outage.
+  - name: a few failures on a quiet gateway are not a high error rate
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="qwen3",status="success",tenant="easy",key="main"}'
+        values: '0+0.6x30'
+      - series: 'gateway_inference_requests_total{model="qwen3",status="error",tenant="easy",key="main"}'
+        values: '0+0.4x30'
+      - series: 'gateway_inference_errors_total{model="qwen3",code="upstream_5xx",tenant="easy",key="main"}'
+        values: '0+0.4x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayHighErrorRate
+        exp_alerts: []
+
+  # 5 failures in 100 requests is 50 times the 0.1% budget.
+  - name: five percent of a model failing pages within minutes
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="qwen3",status="success",tenant="easy",key="main"}'
+        values: '0+95x90'
+      - series: 'gateway_inference_requests_total{model="qwen3",status="error",tenant="easy",key="main"}'
+        values: '0+5x90'
+      - series: 'gateway_inference_errors_total{model="qwen3",code="upstream_timeout",tenant="easy",key="main"}'
+        values: '0+5x90'
+      - series: 'gateway_inference_requests_total{model="bge-m3",status="success",tenant="easy",key="main"}'
+        values: '0+100x90'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: GatewayModelAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              model: qwen3
+            exp_annotations:
+              summary: qwen3 is failing fast enough to spend its availability budget in two days
+              description: >-
+                5% of the requests to qwen3 over the last hour ended in a gateway or upstream
+                failure, against an objective of 0.1%.
+              runbook: docs/runbooks/high-error-rate.md
+
+  # Errors that are the caller's doing do not spend the budget.
+  - name: upstream 4xx and budget refusals are not availability failures
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="qwen3",status="success",tenant="easy",key="main"}'
+        values: '0+50x90'
+      - series: 'gateway_inference_requests_total{model="qwen3",status="error",tenant="easy",key="main"}'
+        values: '0+50x90'
+      - series: 'gateway_inference_errors_total{model="qwen3",code="upstream_4xx",tenant="easy",key="main"}'
+        values: '0+40x90'
+      - series: 'gateway_inference_errors_total{model="qwen3",code="budget_exceeded",tenant="easy",key="main"}'
+        values: '0+10x90'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: GatewayModelAvailabilityFastBurn
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: GatewayModelAvailabilitySlowBurn
+        exp_alerts: []
+
+  # The failures stopped half an hour ago: the hour still shows them, the last five minutes do not.
+  - name: fast burn stops firing once the failures stop
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="qwen3",status="success",tenant="easy",key="main"}'
+        values: '0+100x90'
+      - series: 'gateway_inference_errors_total{model="qwen3",code="upstream_5xx",tenant="easy",key="main"}'
+        values: '0+10x20 200x70'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: GatewayModelAvailabilityFastBurn
+        exp_alerts: []
+
+  # Nine failures an hour on a model taking ten requests a minute is 1.5%, over 14.4 times the
+  # budget, and nine timeouts are not an outage. Before the floor of 10 failures this paged and
+  # resolved all afternoon.
+  - name: a few failures on a quiet model do not page
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="qwen3",status="success",tenant="easy",key="main"}'
+        values: '0+10x90'
+      - series: 'gateway_inference_errors_total{model="qwen3",code="upstream_timeout",tenant="easy",key="main"}'
+        values: '0+0.15x90'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: GatewayModelAvailabilityFastBurn
+        exp_alerts: []
+
+  # 1% failing is 10 times the budget: over the slow threshold of 6, under the fast one of 14.4.
+  - name: one percent failing for hours opens a ticket and does not page
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="qwen3",status="success",tenant="easy",key="main"}'
+        values: '0+99x480'
+      - series: 'gateway_inference_requests_total{model="qwen3",status="error",tenant="easy",key="main"}'
+        values: '0+1x480'
+      - series: 'gateway_inference_errors_total{model="qwen3",code="upstream_body_error",tenant="easy",key="main"}'
+        values: '0+1x480'
+    alert_rule_test:
+      - eval_time: 420m
+        alertname: GatewayModelAvailabilityFastBurn
+        exp_alerts: []
+      - eval_time: 420m
+        alertname: GatewayModelAvailabilitySlowBurn
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              model: qwen3
+            exp_annotations:
+              summary: qwen3 is spending its availability budget six times too fast
+              description: >-
+                1% of the requests to qwen3 over the last 6 hours ended in a gateway or upstream
+                failure, against an objective of 0.1%. Not an outage; open a ticket.
+              runbook: docs/runbooks/high-error-rate.md
+
+  # Every stream answers within a second for a day, then every stream takes between 5 and 10.
+  # The slow phase is light against the day of history so the baseline barely moves while the
+  # alert fires: the description reads the baseline's latest sample, and whether that is this
+  # minute's or the last one's depends on the order promtool evaluates the two groups in. At 10
+  # slow streams a minute the two differed in the last digit (975.7ms against 976.4ms).
+  - name: time to first token well above the weekly baseline warns
+    interval: 1m
+    input_series:
+      - series: 'gateway_time_to_first_token_seconds_bucket{model="qwen3",le="1"}'
+        values: '0+1000x1440 1440000x60'
+      - series: 'gateway_time_to_first_token_seconds_bucket{model="qwen3",le="5"}'
+        values: '0+1000x1440 1440000x60'
+      - series: 'gateway_time_to_first_token_seconds_bucket{model="qwen3",le="10"}'
+        values: '0+1000x1440 1440000+2x60'
+      - series: 'gateway_time_to_first_token_seconds_bucket{model="qwen3",le="+Inf"}'
+        values: '0+1000x1440 1440000+2x60'
+      - series: 'gateway_time_to_first_token_seconds_count{model="qwen3"}'
+        values: '0+1000x1440 1440000+2x60'
+    alert_rule_test:
+      - eval_time: 1430m
+        alertname: GatewayTimeToFirstTokenHigh
+        exp_alerts: []
+      - eval_time: 1480m
+        alertname: GatewayTimeToFirstTokenHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              model: qwen3
+            exp_annotations:
+              summary: Time to first token for qwen3 is well above its weekly baseline
+              description: >-
+                The p95 time to first token for qwen3 has been 9.75s for 15 minutes, more than 50%
+                above its p95 over the last 7 days (950.1ms).
+              runbook: docs/runbooks/high-error-rate.md#slow-not-failing
+
+  # The same day at under a second, then every stream between 1 and 2.5 seconds: the p95 more
+  # than doubles but moves by less than 2 seconds, and nobody waits noticeably longer.
+  - name: a rise of under two seconds in time to first token does not warn
+    interval: 1m
+    input_series:
+      - series: 'gateway_time_to_first_token_seconds_bucket{model="qwen3",le="1"}'
+        values: '0+1000x1440 1440000x60'
+      - series: 'gateway_time_to_first_token_seconds_bucket{model="qwen3",le="2.5"}'
+        values: '0+1000x1440 1440000+100x60'
+      - series: 'gateway_time_to_first_token_seconds_bucket{model="qwen3",le="+Inf"}'
+        values: '0+1000x1440 1440000+100x60'
+      - series: 'gateway_time_to_first_token_seconds_count{model="qwen3"}'
+        values: '0+1000x1440 1440000+100x60'
+    alert_rule_test:
+      - eval_time: 1490m
+        alertname: GatewayTimeToFirstTokenHigh
+        exp_alerts: []
+
+  - name: a restart is reported once and is not also a configuration change
+    interval: 1m
+    input_series:
+      - series: 'gateway_process_start_time_seconds{job="gateway",instance="gateway:8080"}'
+        values: '1000x30 5000x60'
+      # A fresh process reports 0 until its first load.
+      - series: 'gateway_config_version{job="gateway",instance="gateway:8080",section="general"}'
+        values: '11x30 0 11x59'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GatewayRestarted
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: GatewayRestarted
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              job: gateway
+              instance: gateway:8080
+            exp_annotations:
+              summary: The gateway process restarted
+              description: >-
+                The gateway started again within the last 15 minutes. Open streams ended, and the
+                adaptive factors and the usage history in the console start from empty.
+              runbook: docs/runbooks/rate-limit-admin.md#after-a-restart
+      - eval_time: 35m
+        alertname: GatewayConfigChanged
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: GatewayRestarted
+        exp_alerts: []
+
+  - name: a configuration write is reported with the version it produced
+    interval: 1m
+    input_series:
+      - series: 'gateway_process_start_time_seconds{job="gateway",instance="gateway:8080"}'
+        values: '1000x60'
+      - series: 'gateway_config_version{job="gateway",instance="gateway:8080",section="general"}'
+        values: '11x30 12x30'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: GatewayConfigChanged
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              job: gateway
+              instance: gateway:8080
+              section: general
+            exp_annotations:
+              summary: The gateway's configuration changed
+              description: >-
+                The stored configuration (rate limits, quotas, CORS or routes) is now version 12.
+                The admin audit log names who changed what.
+      - eval_time: 50m
+        alertname: GatewayConfigChanged
+        exp_alerts: []

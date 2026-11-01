@@ -1,0 +1,30 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using Autobahn.Persistence.Entities;
+
+namespace Autobahn.Persistence.Configuration;
+
+internal sealed class RateLimitDefaultsEntityConfiguration : IEntityTypeConfiguration<RateLimitDefaultsEntity>
+{
+    public void Configure(EntityTypeBuilder<RateLimitDefaultsEntity> builder)
+    {
+        builder.ToTable("rate_limit_defaults");
+
+        builder.HasKey(d => d.Id);
+
+        // Single-row table; the key is assigned explicitly (always 1), never database-generated.
+        builder.Property(d => d.Id)
+            .ValueGeneratedNever();
+
+        // Defaults to true so databases created before this column existed keep enforcing rate limits
+        // after upgrading. The seed guard in GatewayDbBootstrap never revisits an existing row, so the
+        // column default is the only thing protecting those installs.
+        builder.Property(d => d.Enabled)
+            .HasDefaultValue(true);
+
+        // False for databases created before the column existed, which is the same answer they gave
+        // when adaptation did not exist: enforce exactly the configured tiers.
+        builder.Property(d => d.AdaptiveEnabled)
+            .HasDefaultValue(false);
+    }
+}

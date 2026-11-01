@@ -1,0 +1,535 @@
+groups:
+  - name: Autobahn-gateway
+    rules:
+      # The gateway as a whole failing, across models, within minutes: the burn-rate rules below
+      # judge one model and need an hour of it. Only failures that are not the caller's doing
+      # count, the same codes as those rules. It used to count every error, and one key asking
+      # for a model it has no grant on (insufficient_scope, a third of all requests) fired it with
+      # nothing broken. The second half is the floor: below one request a second the failures are
+      # held against one a second, so a quiet gateway's two failures out of five do not fire. The
+      # first half is there for its value, the true share.
+      - alert: GatewayHighErrorRate
+        expr: |
+          sum(rate(gateway_inference_errors_total{code=~"upstream_5xx|upstream_timeout|upstream_first_byte_timeout|upstream_body_error|upstream_error|stream_idle_timeout|backend_unhealthy|circuit_open|bulkhead_full|unhandled"}[5m]))
+            / sum(rate(gateway_inference_requests_total[5m])) > 0.05
+          and
+          sum(rate(gateway_inference_errors_total{code=~"upstream_5xx|upstream_timeout|upstream_first_byte_timeout|upstream_body_error|upstream_error|stream_idle_timeout|backend_unhealthy|circuit_open|bulkhead_full|unhandled"}[5m]))
+            / clamp_min(sum(rate(gateway_inference_requests_total[5m])), 1) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than 5% of all inference requests are failing
+          description: >-
+            {{ $value | humanizePercentage }} of the inference requests over the last 5 minutes
+            ended in a gateway or upstream failure. Most frequent, by count:
+            {{ range $i, $e := query "sort_desc(topk(3, sum by (model, code) (increase(gateway_inference_errors_total{code=~\"upstream_5xx|upstream_timeout|upstream_first_byte_timeout|upstream_body_error|upstream_error|stream_idle_timeout|backend_unhealthy|circuit_open|bulkhead_full|unhandled\"}[5m])) > 0))" }}{{ if $i }}; {{ end }}{{ $e.Labels.model }} {{ $e.Labels.code }} {{ $e.Value | printf "%.0f" }}{{ end }}
+          runbook: docs/runbooks/high-error-rate.md
+      # `absent()` is the half that was missing. max() over an empty series returns nothing rather
+      # than 0, so a gateway whose registry is empty — or whose routes were all stopped or lost —
+      # evaluated to no samples and never alerted, which is precisely the outage that matters most.
+      - alert: GatewayNoHealthyBackends
+        expr: max(gateway_backend_health) == 0 or absent(gateway_backend_health)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: No healthy backends registered
+          description: >-
+            Every registered backend is failing its health check, or the gateway exports no backend
+            health at all. No inference request can be served.
+          runbook: docs/runbooks/all-backends-down.md
+      # Distinguishes "the backends are down" from "there are no backends". A fresh install sits
+      # here until an operator adds a route; anything else means the registry was emptied or failed
+      # to load, and the gateway is answering readiness probes while able to serve nothing.
+      - alert: GatewayNoModelsConfigured
+        expr: gateway_models_configured == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Gateway has no models configured
+          description: >-
+            The registry holds no route the gateway will serve. Expected on a fresh install before
+            the first model is added; otherwise the registry was emptied, every route was stopped,
+            or the models file failed to load.
+          runbook: docs/runbooks/all-backends-down.md
+      - alert: GatewayUsageParseFailures
+        expr: sum(rate(gateway_usage_parse_failures_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Upstream usage JSON parse failures elevated
+          description: >-
+            Usage could not be read from {{ $value | printf "%.2f" }} responses a second, so those
+            requests are recorded without token counts. Check that upstream responses include a
+            usage block.
+          runbook: docs/observability.md
+      # The billing ledger and the rollups derived from it have diverged. Everything an operator
+      # reads — admin usage, budgets, the daily webhook — comes from the rollups, so this is the
+      # only signal that those numbers have stopped matching what was actually recorded.
+      - alert: GatewayBillingReconciliationDrift
+        expr: gateway_billing_reconciliation_discrepancies > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Billing rollups disagree with the billing event ledger
+          description: >-
+            {{ $value }} rollup bucket(s) diverge from the ledger
+            (gateway_billing_reconciliation_cost_drift shows the money difference).
+            The ledger is authoritative.
+          runbook: docs/finops.md#reconciliation
+      # A sweep that stops running looks exactly like a healthy one on the gauge above, because the
+      # gauge simply holds its last value. This is what distinguishes the two.
+      - alert: GatewayBillingReconciliationStalled
+        expr: increase(gateway_billing_reconciliation_runs_total[3h]) == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Billing reconciliation has stopped running
+          description: >-
+            No reconciliation sweep completed in 3h. Billing divergence is now undetected.
+          runbook: docs/finops.md#reconciliation
+      - alert: GatewayCircuitBreakerOpen
+        expr: max by (model) (gateway_circuit_breaker_state) == 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Circuit breaker open for {{ $labels.model }}'
+          runbook: docs/runbooks/high-error-rate.md#circuit-breaker-open
+          # The breaker opens for every caller of the model. The list says whose requests failed,
+          # so a failure that follows one caller can be told from a backend that fails everyone.
+          description: >-
+            The gateway is answering circuit_open for {{ $labels.model }} without forwarding.
+            Backend failures by caller over the last 10 minutes:
+            {{ range $i, $caller := query (printf `sort_desc(sum by (tenant, key) (increase(gateway_inference_errors_total{model=%q,code=~"upstream_(5xx|timeout|first_byte_timeout|body_error|error)"}[10m])) / on() group_left() sum(increase(gateway_inference_errors_total{model=%q,code=~"upstream_(5xx|timeout|first_byte_timeout|body_error|error)"}[10m])) > 0)` $labels.model $labels.model) }}{{ if $i }}; {{ end }}{{ $caller.Labels.tenant }}/{{ $caller.Labels.key }} {{ $caller.Value | humanizePercentage }}{{ end }}
+      # --- Rate limiting ---------------------------------------------------------------
+      # Until these existed the subsystem had no alerting at all: a partition-table flood
+      # degraded enforcement with nothing but a single log line to show for it, and a
+      # credential-stuffing run produced a clear metric signal nobody was watching.
+      - alert: GatewayRateLimitsNotEnforced
+        expr: sum(rate(gateway_rate_limit_forced_evictions_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Rate limits are not being fully enforced
+          description: >-
+            The partition table is at its ceiling, so the sweep is evicting buckets that still
+            had budget spent. Each one starts full again on its next request, so the callers
+            being evicted are not being limited. Raise RateLimiting:InMemoryMaxPartitions or
+            shorten RateLimiting:InMemoryPartitionRetentionSeconds.
+          runbook: docs/runbooks/rate-limit-admin.md#partition-ceiling
+      - alert: GatewayRateLimitPartitionsNearCeiling
+        expr: |
+          max(gateway_rate_limit_partitions{dimension!="ceiling"})
+            / clamp_min(max(gateway_rate_limit_partitions{dimension="ceiling"}), 1) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Rate-limit partition table above 80% of its ceiling
+          description: >-
+            Approaching the point at which enforcement starts being dropped to stay under the
+            ceiling. The ratio is computed against the exported ceiling rather than a literal,
+            so it tracks the configured value.
+          runbook: docs/runbooks/rate-limit-admin.md#partition-ceiling
+      # The in-app `rate_limit_refusing` item, as a rule: one alert per refusing limit kind while
+      # refusals are at least 10% of all decisions. Three things in the expression are deliberate.
+      # The denominator adds the refusals back, because a request refused by a rate limit never
+      # reaches the router and so is not in gateway_inference_requests_total — but only the
+      # `rate_limit:` and `token_limit:` ones, since a stream-slot refusal is decided in the
+      # router and is already counted there. `or vector(0)` on each half is what keeps the rule alive when one side has
+      # no series: a gateway refusing everything has no inference series at all, and a sum over
+      # nothing is no sample rather than 0, which would have silenced the alert in exactly the
+      # case it exists for. And the control-plane and failed-sign-in budgets are left out: they
+      # have their own rules below and are not inference decisions.
+      - alert: GatewayRateLimitRefusing
+        expr: |
+          sum by (reason) (rate(gateway_rate_limit_rejections_total{reason=~"(rate_limit|token_limit|stream_concurrency):.+",reason!="rate_limit:control_plane"}[5m]))
+            / on() group_left()
+              (
+                (sum(rate(gateway_inference_requests_total[5m])) or vector(0))
+                + (sum(rate(gateway_rate_limit_rejections_total{reason=~"(rate_limit|token_limit):.+",reason!="rate_limit:control_plane"}[5m])) or vector(0))
+              )
+          and on()
+            (
+              sum(rate(gateway_rate_limit_rejections_total{reason=~"(rate_limit|token_limit|stream_concurrency):.+",reason!="rate_limit:control_plane"}[5m]))
+                /
+                  (
+                    (sum(rate(gateway_inference_requests_total[5m])) or vector(0))
+                    + (sum(rate(gateway_rate_limit_rejections_total{reason=~"(rate_limit|token_limit):.+",reason!="rate_limit:control_plane"}[5m])) or vector(0))
+                  )
+              >= 0.10
+            )
+          and on()
+            (
+              (sum(increase(gateway_inference_requests_total[5m])) or vector(0))
+              + (sum(increase(gateway_rate_limit_rejections_total{reason=~"(rate_limit|token_limit):.+",reason!="rate_limit:control_plane"}[5m])) or vector(0))
+              >= 20
+            )
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Rate limits are refusing at least 10% of inference requests
+          description: >-
+            {{ $labels.reason }} accounts for {{ $value | humanizePercentage }} of all rate-limit
+            decisions over the last 5 minutes. The reason names the limit and the scope that
+            refused: `rate_limit:tenant` is a tenant's request bucket and `token_limit:tenant` its
+            tokens per minute; every key of that tenant shares both, so one busy key can be
+            refusing all the others. The series carries no caller label; the admin API names the
+            keys.
+          runbook: docs/runbooks/rate-limit-admin.md#refusals
+      # The same condition judged per tenant, from the series that name the caller, and sent to
+      # that tenant's team: `team` is the tenant slug, which an Alertmanager route can claim, and an
+      # alert no route claims stays with the gateway owner. The share is of the tenant's own
+      # decisions, so one team storming into its bucket does not alert the team next to it. No
+      # `or vector(0)` here: a tenant with no decisions has nothing to be told, and a tenant refused
+      # on every request still has its refused series on both sides of the division.
+      - alert: GatewayTenantThrottled
+        expr: |
+          sum by (tenant) (rate(gateway_rate_limit_decisions_total{outcome="refused"}[5m]))
+            / sum by (tenant) (rate(gateway_rate_limit_decisions_total[5m]))
+            > 0.10
+          and
+            sum by (tenant) (increase(gateway_rate_limit_decisions_total[5m])) >= 20
+        for: 10m
+        labels:
+          severity: warning
+          team: '{{ $labels.tenant }}'
+        annotations:
+          summary: Tenant {{ $labels.tenant }} is being rate limited
+          description: >-
+            {{ $value | humanizePercentage }} of the rate-limit decisions for tenant
+            {{ $labels.tenant }} over the last 5 minutes were refusals.
+          runbook: docs/runbooks/rate-limit-admin.md#tenant-throttled
+      # One key that keeps sending while almost everything it sends is refused: a client retrying
+      # without backing off. Judged per key and sent to the key's tenant, like the rule above.
+      # "Keeps sending" is the attempt rate not having fallen against five minutes earlier; a key
+      # with no decisions then is compared with zero.
+      - alert: GatewayRetryStorm
+        expr: |
+          sum by (tenant, key) (rate(gateway_rate_limit_decisions_total{outcome="refused"}[5m]))
+            / sum by (tenant, key) (rate(gateway_rate_limit_decisions_total[5m]))
+            > 0.80
+          and
+            sum by (tenant, key) (increase(gateway_rate_limit_decisions_total[5m])) >= 20
+          and
+            sum by (tenant, key) (rate(gateway_rate_limit_decisions_total[5m]))
+              >= (
+                sum by (tenant, key) (rate(gateway_rate_limit_decisions_total[5m] offset 5m))
+                or sum by (tenant, key) (rate(gateway_rate_limit_decisions_total[5m])) * 0
+              )
+        for: 5m
+        labels:
+          severity: warning
+          team: '{{ $labels.tenant }}'
+        annotations:
+          summary: Key {{ $labels.key }} of tenant {{ $labels.tenant }} keeps retrying into its limit
+          description: >-
+            {{ $value | humanizePercentage }} of the rate-limit decisions for key {{ $labels.key }}
+            over the last 5 minutes were refusals, and it has not slowed down. The client is
+            retrying without honouring Retry-After.
+          runbook: docs/runbooks/rate-limit-admin.md#retry-storm
+      # One key sends more than half of a model's requests while a tenant other than its own is
+      # being refused. The two halves are joined loosely on purpose: tenant, key and global limits
+      # are decided before the body is parsed, so a refusal seldom names the model it was for.
+      # The first branch covers a noisy key whose own tenant is refused too (two refused tenants
+      # means one of them is somebody else); the second covers a noisy key whose tenant is not.
+      - alert: GatewayNoisyNeighbour
+        expr: |
+          (
+            (
+              sum by (model, tenant, key) (rate(gateway_inference_requests_total[5m]))
+                / on(model) group_left()
+                  sum by (model) (rate(gateway_inference_requests_total[5m]))
+              > 0.50
+            )
+            and on(model)
+              sum by (model) (increase(gateway_inference_requests_total[5m])) >= 50
+          )
+          and on()
+            (count(sum by (tenant) (rate(gateway_rate_limit_decisions_total{outcome="refused"}[5m])) > 0) >= 2)
+          or
+          (
+            (
+              sum by (model, tenant, key) (rate(gateway_inference_requests_total[5m]))
+                / on(model) group_left()
+                  sum by (model) (rate(gateway_inference_requests_total[5m]))
+              > 0.50
+            )
+            and on(model)
+              sum by (model) (increase(gateway_inference_requests_total[5m])) >= 50
+            unless on(tenant)
+              (sum by (tenant) (rate(gateway_rate_limit_decisions_total{outcome="refused"}[5m])) > 0)
+          )
+          and on()
+            (count(sum by (tenant) (rate(gateway_rate_limit_decisions_total{outcome="refused"}[5m])) > 0) >= 1)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Key {{ $labels.key }} dominates {{ $labels.model }} while another tenant is refused
+          description: >-
+            Key {{ $labels.key }} of tenant {{ $labels.tenant }} sent
+            {{ $value | humanizePercentage }} of the requests to {{ $labels.model }} over the last
+            5 minutes, and at least one other tenant is being rate limited.
+          runbook: docs/runbooks/rate-limit-admin.md#noisy-neighbour
+      # One key suddenly sending far more than it did: the burst that loads a backend's GPUs before
+      # any limit refuses it. The noisy-neighbour rule above needs somebody refused, and on
+      # 2026-10-12 nobody was: bv-dev went to 419 requests a minute on DeepSeek-V4.1-Flash, the
+      # model's concurrency filled and other callers waited, and no alert named the key. The floor
+      # is 2 requests a second averaged over 5 minutes, above every other key's busiest 5 minutes
+      # that week (90 a minute); the second half asks for twice the key's rate over the hour before,
+      # so a key that is always busy is not reported all day. A key with no requests in that hour is
+      # compared with zero. Bursts last minutes, so it is held 2 minutes, not 5. It stays with the
+      # gateway owner: the key may be inside every limit it has, and the fix is usually one.
+      - alert: GatewayKeyRequestSpike
+        expr: |
+          sum by (tenant, key) (rate(gateway_inference_requests_total{key!=""}[5m])) * 60 >= 120
+          and
+            sum by (tenant, key) (rate(gateway_inference_requests_total{key!=""}[5m]))
+              >= 2 * (
+                sum by (tenant, key) (rate(gateway_inference_requests_total{key!=""}[1h] offset 5m))
+                or sum by (tenant, key) (rate(gateway_inference_requests_total{key!=""}[5m])) * 0
+              )
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Key {{ $labels.key }} of tenant {{ $labels.tenant }} is sending {{ $value | printf "%.0f" }} requests a minute
+          description: >-
+            Key {{ $labels.key }} of tenant {{ $labels.tenant }} averaged
+            {{ $value | printf "%.0f" }} requests a minute over the last 5 minutes, at least twice
+            its rate over the hour before. By model:
+            {{ range $i, $m := query (printf `sort_desc(sum by (model) (rate(gateway_inference_requests_total{tenant=%q,key=%q}[5m])) * 60 > 0)` $labels.tenant $labels.key) }}{{ if $i }}; {{ end }}{{ $m.Labels.model }} {{ $m.Value | printf "%.0f" }}/min{{ end }}
+          runbook: docs/runbooks/rate-limit-admin.md#key-spike
+      # The same jump measured in tokens, which is what a backend's GPUs spend: a few requests with
+      # very long prompts load a model as much as a flood of short ones. The floor is 4 million
+      # tokens a minute over 5 minutes; the busiest keys of that week peaked at 6 to 9 million.
+      - alert: GatewayKeyTokenSpike
+        expr: |
+          sum by (tenant, key) (rate(gateway_tokens_total{key!="",direction="total"}[5m])) * 60 >= 4e6
+          and
+            sum by (tenant, key) (rate(gateway_tokens_total{key!="",direction="total"}[5m]))
+              >= 2 * (
+                sum by (tenant, key) (rate(gateway_tokens_total{key!="",direction="total"}[1h] offset 5m))
+                or sum by (tenant, key) (rate(gateway_tokens_total{key!="",direction="total"}[5m])) * 0
+              )
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Key {{ $labels.key }} of tenant {{ $labels.tenant }} is using {{ $value | humanize }} tokens a minute
+          description: >-
+            Key {{ $labels.key }} of tenant {{ $labels.tenant }} averaged {{ $value | humanize }}
+            tokens a minute over the last 5 minutes, at least twice its rate over the hour before.
+            By model:
+            {{ range $i, $m := query (printf `sort_desc(sum by (model) (rate(gateway_tokens_total{tenant=%q,key=%q,direction="total"}[5m])) * 60 > 0)` $labels.tenant $labels.key) }}{{ if $i }}; {{ end }}{{ $m.Labels.model }} {{ $m.Value | humanize }}/min{{ end }}
+          runbook: docs/runbooks/rate-limit-admin.md#key-spike
+      # A model rule's bucket is shared by every caller of the model, so this is the model
+      # approaching the ceiling set for it, before anybody is refused. `team: capacity` lets an
+      # Alertmanager route send it to whoever owns the backends.
+      - alert: GatewayModelNearCeiling
+        expr: max by (limit_id) (gateway_rate_limit_utilization_ratio{limit_id=~"model:.+"}) > 0.85
+        for: 15m
+        labels:
+          severity: warning
+          team: capacity
+        annotations:
+          summary: '{{ $labels.limit_id }} is above 85% of its rate limit'
+          description: >-
+            Requests admitted under {{ $labels.limit_id }} have averaged
+            {{ $value | humanizePercentage }} of its configured rate for 15 minutes. Past 100%
+            every caller of the model is refused.
+          runbook: docs/runbooks/rate-limit-admin.md#model-near-ceiling
+      - alert: GatewayCredentialGuessing
+        expr: sum(rate(gateway_rate_limit_rejections_total{reason="auth_failure"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Sustained credential-guessing refusals
+          description: >-
+            One or more client address blocks are spending their auth-failure budget
+            continuously, which is what a credential-stuffing run looks like from here.
+          runbook: docs/runbooks/rate-limit-admin.md#credential-guessing
+      - alert: GatewayControlPlaneThrottled
+        expr: sum(rate(gateway_rate_limit_rejections_total{reason="rate_limit:control_plane"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Admin API calls are being rate limited
+          description: >-
+            An operator credential is over the control-plane budget, so admin calls made with it
+            are refused. The budget is per credential and lives in appsettings
+            (RateLimiting:ControlPlane), so it cannot be raised from the console.
+          runbook: docs/runbooks/rate-limit-admin.md#control-plane-budget
+      # Hard stop is the critical budget state: the gateway is refusing the tenant. A budget that is
+      # merely near its warning ratio stays on the FinOps dashboard. max() collapses replicas, which
+      # each export the same snapshot.
+      - alert: GatewayBudgetHardStop
+        expr: max by (tenant, budget) (gateway_budget_spend_ratio{hard_stop="true"}) >= 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Budget hard stop is refusing a tenant
+          description: >-
+            Budget {{ $labels.budget }} for tenant {{ $labels.tenant }} is exhausted and hard stop
+            is on, so inference for that tenant is refused.
+          runbook: docs/finops.md#budget-hard-stop
+      # The console lists unpriced models as info. Held for an hour here so a model that is about
+      # to receive a rate card does not page, while a model left unpriced keeps costing zero.
+      - alert: GatewayUnpricedModels
+        expr: max(gateway_unpriced_models) > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: Registered models have no rate card
+          description: >-
+            {{ $value }} model(s) record usage at zero cost. Set prices under Routing → Models.
+          runbook: docs/finops.md#model-pricing-rate-cards
+      # --- Service levels --------------------------------------------------------------
+      # Availability per model: 99.9% of admitted requests over 30 days do not end in a gateway or
+      # upstream failure. The codes are the failures that are not the caller's doing; a 4xx the
+      # backend returned, a budget refusal and a client that hung up are left out. Requests a rate
+      # limit refused never reach these series, so they are not in the ratio either.
+      #
+      # Two burn rates, each held over a long and a short window: the long one makes it
+      # significant, the short one makes it stop firing once the failures stop. 14.4 times the
+      # budget spends 2% of a month's allowance in an hour; 6 times spends 5% in six hours.
+      #
+      # A floor on the failures themselves, not only on the requests: on a model taking ten
+      # requests a minute one timeout in five minutes is over 14.4 times the budget, and the alert
+      # paged and resolved every few minutes (Qwen3.8-27B, 2026-10-12). `keep_firing_for` holds it
+      # through the minutes the short window happens to hold no failure, so a model failing on and
+      # off is one alert.
+      - alert: GatewayModelAvailabilityFastBurn
+        expr: |
+          (
+            sum by (model) (rate(gateway_inference_errors_total{code=~"upstream_5xx|upstream_timeout|upstream_first_byte_timeout|upstream_body_error|upstream_error|stream_idle_timeout|backend_unhealthy|circuit_open|bulkhead_full|unhandled"}[1h]))
+              / sum by (model) (rate(gateway_inference_requests_total[1h]))
+            > (14.4 * 0.001)
+          )
+          and
+          (
+            sum by (model) (rate(gateway_inference_errors_total{code=~"upstream_5xx|upstream_timeout|upstream_first_byte_timeout|upstream_body_error|upstream_error|stream_idle_timeout|backend_unhealthy|circuit_open|bulkhead_full|unhandled"}[5m]))
+              / sum by (model) (rate(gateway_inference_requests_total[5m]))
+            > (14.4 * 0.001)
+          )
+          and
+            sum by (model) (increase(gateway_inference_requests_total[1h])) >= 50
+          and
+            sum by (model) (increase(gateway_inference_errors_total{code=~"upstream_5xx|upstream_timeout|upstream_first_byte_timeout|upstream_body_error|upstream_error|stream_idle_timeout|backend_unhealthy|circuit_open|bulkhead_full|unhandled"}[1h])) >= 10
+        for: 2m
+        keep_firing_for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: '{{ $labels.model }} is failing fast enough to spend its availability budget in two days'
+          description: >-
+            {{ $value | humanizePercentage }} of the requests to {{ $labels.model }} over the last
+            hour ended in a gateway or upstream failure, against an objective of 0.1%.
+          runbook: docs/runbooks/high-error-rate.md
+      - alert: GatewayModelAvailabilitySlowBurn
+        expr: |
+          (
+            sum by (model) (rate(gateway_inference_errors_total{code=~"upstream_5xx|upstream_timeout|upstream_first_byte_timeout|upstream_body_error|upstream_error|stream_idle_timeout|backend_unhealthy|circuit_open|bulkhead_full|unhandled"}[6h]))
+              / sum by (model) (rate(gateway_inference_requests_total[6h]))
+            > (6 * 0.001)
+          )
+          and
+          (
+            sum by (model) (rate(gateway_inference_errors_total{code=~"upstream_5xx|upstream_timeout|upstream_first_byte_timeout|upstream_body_error|upstream_error|stream_idle_timeout|backend_unhealthy|circuit_open|bulkhead_full|unhandled"}[30m]))
+              / sum by (model) (rate(gateway_inference_requests_total[30m]))
+            > (6 * 0.001)
+          )
+          and
+            sum by (model) (increase(gateway_inference_requests_total[6h])) >= 100
+          and
+            sum by (model) (increase(gateway_inference_errors_total{code=~"upstream_5xx|upstream_timeout|upstream_first_byte_timeout|upstream_body_error|upstream_error|stream_idle_timeout|backend_unhealthy|circuit_open|bulkhead_full|unhandled"}[6h])) >= 20
+        for: 15m
+        keep_firing_for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: '{{ $labels.model }} is spending its availability budget six times too fast'
+          description: >-
+            {{ $value | humanizePercentage }} of the requests to {{ $labels.model }} over the last
+            6 hours ended in a gateway or upstream failure, against an objective of 0.1%. Not an
+            outage; open a ticket.
+          runbook: docs/runbooks/high-error-rate.md
+      # Time to first token against the model's own last week, since no fixed target fits both a
+      # small embedding model and a large reasoning one. The baseline is the recording rule in the
+      # group below. The histogram's buckets are coarse, so the floor of 20 streams keeps a quiet
+      # model's p95 from being one slow request, and the margin is 50%: at 20% a busy quarter of an
+      # hour moved the p95 within one bucket and fired. The p95 must also be 2 seconds over the
+      # baseline: a model whose usual p95 is a second went to two and warned many times a day
+      # without anyone waiting noticeably longer (2026-10-12). `keep_firing_for` holds the alert
+      # through a dip under the line, so a model hovering at it is one alert and not one an hour.
+      - alert: GatewayTimeToFirstTokenHigh
+        expr: |
+          histogram_quantile(0.95, sum by (model, le) (rate(gateway_time_to_first_token_seconds_bucket[15m])))
+            > 1.5 * gateway:time_to_first_token_seconds:p95_7d
+          and
+          histogram_quantile(0.95, sum by (model, le) (rate(gateway_time_to_first_token_seconds_bucket[15m])))
+            > gateway:time_to_first_token_seconds:p95_7d + 2
+          and
+            sum by (model) (increase(gateway_time_to_first_token_seconds_count[15m])) >= 20
+        for: 15m
+        keep_firing_for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Time to first token for {{ $labels.model }} is well above its weekly baseline'
+          description: >-
+            The p95 time to first token for {{ $labels.model }} has been {{ $value | humanizeDuration }}
+            for 15 minutes, more than 50% above its p95 over the last 7 days
+            ({{ with query (printf "gateway:time_to_first_token_seconds:p95_7d{model=%q}" $labels.model) }}{{ . | first | value | humanizeDuration }}{{ end }}).
+          runbook: docs/runbooks/high-error-rate.md#slow-not-failing
+      # --- Process and configuration ---------------------------------------------------
+      # Both are information, not faults: they are what to look for first when something else
+      # fires. A restart ends every open stream and resets the adaptive factors, escalated
+      # Retry-After values and the in-memory usage history. Token buckets are restored from the
+      # last snapshot (RateLimiting:BucketSnapshotIntervalSeconds) when a database is configured.
+      - alert: GatewayRestarted
+        expr: changes(gateway_process_start_time_seconds[15m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: The gateway process restarted
+          description: >-
+            The gateway started again within the last 15 minutes. Open streams ended, and the
+            adaptive factors and the usage history in the console start from empty.
+          runbook: docs/runbooks/rate-limit-admin.md#after-a-restart
+      # Left out for a restart: a fresh process reports version 0 until its first load.
+      - alert: GatewayConfigChanged
+        expr: |
+          changes(gateway_config_version[10m]) > 0
+          unless on(job, instance)
+            changes(gateway_process_start_time_seconds[15m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: The gateway's configuration changed
+          description: >-
+            The stored configuration (rate limits, quotas, CORS or routes) is now version
+            {{ with query (printf "max(gateway_config_version{instance=%q})" $labels.instance) }}{{ . | first | value }}{{ end }}.
+            The admin audit log names who changed what.
+
+  # Evaluated every 5 minutes: a week of buckets per model is too much to read on every tick, and a
+  # baseline does not need to be fresher than that.
+  - name: Autobahn-baselines
+    interval: 5m
+    rules:
+      - record: gateway:time_to_first_token_seconds:p95_7d
+        expr: |
+          histogram_quantile(0.95, sum by (model, le) (rate(gateway_time_to_first_token_seconds_bucket[7d])))

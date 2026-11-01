@@ -1,0 +1,15 @@
+{
+  "Fleet": {
+    "PollSeconds": 15,
+    "SessionHours": 8,
+    "Nodes": [
+      {
+        "Id": "node-a",
+        "Address": "https://node-a.example.com:9455",
+        "InferenceAddress": "https://node-a.example.com",
+        "Token": "SET_THROUGH_AN_ENVIRONMENT_VARIABLE"
+      }
+    ],
+    "GitOps": { "Url": "", "Project": "", "Branch": "main", "Token": "" }
+  }
+}

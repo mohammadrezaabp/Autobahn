@@ -1,0 +1,251 @@
+namespace Autobahn.Domain.Configuration;
+
+public sealed class GatewayResilienceOptions
+{
+    public const string SectionName = "Resilience";
+
+    /// <summary>
+    /// Base allowance for the upstream to return response <em>headers</em>. A breach means the
+    /// backend never answered at all, which is a genuine health signal and counts toward the circuit
+    /// breaker.
+    ///
+    /// The response body is governed by <see cref="StreamIdleTimeoutSeconds"/> in both streaming and
+    /// non-streaming mode, and the allowance itself is widened per
+    /// <see cref="ForwardTimeoutSecondsPerRequestMegabyte"/>. Applying a single total-duration cap
+    /// truncated long-but-healthy generations and recorded them as backend failures, which opened
+    /// the breaker on models that were working correctly.
+    /// </summary>
+    public int ForwardTimeoutSeconds { get; set; } = 300;
+
+    /// <summary>
+    /// Extra header allowance granted per megabyte of request body actually forwarded.
+    /// </summary>
+    /// <remarks>
+    /// <para>Time to first response byte scales with the prompt, because the backend must read and
+    /// pre-fill the whole context before it can answer. A fixed allowance therefore expires on
+    /// long-context requests purely because they are long, and the breaker counted each expiry
+    /// against a backend that was working correctly — enough concurrent large-context requests took
+    /// the model out of service for every caller.</para>
+    ///
+    /// <para>At the default, the 25 MB body cap buys 25 further minutes on top of
+    /// <see cref="ForwardTimeoutSeconds"/>, while a small request is unaffected. Set to 0 to restore
+    /// a flat allowance.</para>
+    /// </remarks>
+    public int ForwardTimeoutSecondsPerRequestMegabyte { get; set; } = 60;
+
+    /// <summary>
+    /// Ceiling on the scaled header allowance, so an oversized body can never grant an effectively
+    /// unbounded deadline.
+    /// </summary>
+    public int MaxForwardTimeoutSeconds { get; set; } = 3600;
+
+    /// <summary>
+    /// Maximum gap between two chunks of a response body before the gateway gives up. The clock
+    /// resets on every chunk forwarded to the client, so a response of any total duration survives as
+    /// long as the upstream keeps producing.
+    ///
+    /// A breach means the upstream stalled after it had already answered, which says nothing
+    /// conclusive about backend health, so it abandons the circuit-breaker probe rather than
+    /// recording a failure. Applies to non-streaming responses too: transferring a large body is not
+    /// evidence of ill health either.
+    /// </summary>
+    public int StreamIdleTimeoutSeconds { get; set; } = 120;
+
+    /// <summary>
+    /// Longest a single write of response-body bytes to the client may take before the gateway gives
+    /// up on it. Measured per write, so a client that keeps consuming is never affected however long
+    /// the whole response runs.
+    /// </summary>
+    /// <remarks>
+    /// <para>This is the application's own bound on a downstream stall, and it exists because the
+    /// gateway holds expensive state for the whole of a forward: the upstream connection, a per-model
+    /// bulkhead slot, a stream-concurrency slot and a budget reservation. A client that stops reading
+    /// applies backpressure all the way through to the upstream read, so without a bound here that
+    /// state is retained for as long as the client holds the socket open.</para>
+    ///
+    /// <para>Kestrel's <c>MinResponseDataRate</c> (240 B/s after a 5 s grace, by default) normally
+    /// aborts such a connection first, and the abort surfaces as a client disconnect. That is a
+    /// transport-level guard on a different measure — average throughput, not per-write latency — and
+    /// it is the host's to configure or remove. Correctness does not depend on it: this timeout bounds
+    /// the write whether or not the host has any rate limit, and an operator who relaxes Kestrel's
+    /// rate for long-lived SSE clients (a common change) keeps a bound here.</para>
+    ///
+    /// <para>A breach is attributed to the client, not the backend: it is reported as
+    /// <c>client_write_timeout</c> and is never counted against the circuit breaker.</para>
+    /// </remarks>
+    public int DownstreamWriteTimeoutSeconds { get; set; } = 120;
+
+    public long MaxRequestBodyBytes { get; set; } = 26_214_400;
+
+    /// <summary>
+    /// Slowest a client may deliver a request body, in bytes per second, before the server aborts
+    /// the read with <c>request_incomplete</c> ("data arriving too slowly"). 0 disables the check.
+    /// </summary>
+    /// <remarks>
+    /// <para>This is Kestrel's <c>MinRequestBodyDataRate</c>, which the gateway previously left at
+    /// the framework default and did not expose. The rate is averaged over the whole body read once
+    /// <see cref="MinRequestBodyDataRateGraceSeconds"/> has elapsed, so a client that <em>pauses</em>
+    /// mid-upload — a batch job building each embedding input as it goes, a proxy that buffers the
+    /// body in pieces — trips it even though its throughput while sending is fine.</para>
+    ///
+    /// <para>The default is the framework's. Raise the grace period, or lower the rate, only for a
+    /// gateway whose callers are known to send bodies in bursts; the check is what keeps a
+    /// slow-loris upload from holding a connection open indefinitely.</para>
+    /// </remarks>
+    public double MinRequestBodyBytesPerSecond { get; set; } = 240;
+
+    /// <summary>
+    /// How long after the body read begins before <see cref="MinRequestBodyBytesPerSecond"/> is
+    /// enforced. Kestrel's default is 5 seconds.
+    /// </summary>
+    public int MinRequestBodyDataRateGraceSeconds { get; set; } = 5;
+
+    /// <summary>
+    /// How much of an inference request body is held in memory before it spills to a temporary file.
+    /// </summary>
+    /// <remarks>
+    /// <para>The gateway buffers every inference body so it can be parsed for routing and then
+    /// replayed to the upstream. ASP.NET's default threshold is 30 KB, which is smaller than an
+    /// ordinary long-context chat request — so a typical RAG call was written to disk and read back
+    /// two or three times (the routing parse, the length used for the forward allowance, and the
+    /// send itself) before it ever reached the model server.</para>
+    ///
+    /// <para>The cost of raising it is memory: at worst this many bytes times the number of requests
+    /// buffering at once, which the per-model bulkhead bounds
+    /// (<see cref="MaxConcurrentForwardsPerModel"/>). The default trades roughly 64 MB at full
+    /// per-model concurrency for keeping normal traffic off the disk entirely. Raise it if prompts
+    /// are routinely larger and the pod has the headroom; lower it if memory is the tighter
+    /// constraint.</para>
+    /// </remarks>
+    public int RequestBufferThresholdBytes { get; set; } = 262_144;
+
+    /// <summary>
+    /// How long the gateway keeps serving after it starts draining, so load balancers have time to
+    /// observe the readiness probe flip and stop routing to this instance.
+    /// </summary>
+    /// <remarks>
+    /// <para>Should be a small multiple of the readiness probe interval, and the host's shutdown
+    /// timeout must exceed it or the drain is cut short.</para>
+    ///
+    /// <para>Defaults to 0 — stop immediately — because a nonzero value delays <em>every</em>
+    /// shutdown, including local runs and test hosts, and only load-balanced deployments benefit.
+    /// Set it wherever a load balancer or Kubernetes service fronts the gateway: without it the
+    /// readiness probe flips at the same instant Kestrel stops accepting, so the balancer keeps
+    /// routing to an instance that is already tearing down and every rolling restart drops requests.
+    /// The Helm chart sets it.</para>
+    /// </remarks>
+    public int ShutdownDrainSeconds { get; set; }
+
+    /// <summary>
+    /// Upper bound on requests forwarded to one model at the same time (the per-model bulkhead).
+    /// </summary>
+    /// <remarks>
+    /// <para>This is a gateway-side ceiling on <em>in-flight</em> forwards, not a queue: it exists to
+    /// protect the gateway's own memory and to stop one model's backlog from starving the others.
+    /// The model server keeps its own admission queue (vLLM's scheduler, Ollama's
+    /// <c>OLLAMA_MAX_QUEUE</c>), so the correct value is at least the backend's own concurrency
+    /// (vLLM's <c>--max-num-seqs</c>, default 256). Set lower than the backend's and the gateway,
+    /// not the GPU, becomes the ceiling on throughput.</para>
+    ///
+    /// <para>The previous default of 64 was well below what a single GPU serving with continuous
+    /// batching handles, and every request past it was refused with 429 rather than waited on —
+    /// which is what made a busy gateway look like it was serving callers one batch at a time.</para>
+    /// </remarks>
+    public int MaxConcurrentForwardsPerModel { get; set; } = 256;
+
+    /// <summary>
+    /// How many requests may wait for a bulkhead slot per model once
+    /// <see cref="MaxConcurrentForwardsPerModel"/> is reached, before further arrivals are refused
+    /// with 429 immediately. 0 disables queueing (refuse at capacity, the previous behaviour).
+    /// </summary>
+    /// <remarks>
+    /// A short bounded queue turns a burst above the cap into a brief wait instead of a 429 that
+    /// the client SDK then retries with exponential backoff — the retry loop is slower for the
+    /// caller and adds load for everyone else. The queue is bounded, and each waiter is bounded by
+    /// <see cref="BulkheadQueueTimeoutSeconds"/>, so it cannot become an unbounded backlog: past
+    /// either bound the gateway sheds load rather than absorbing it.
+    /// </remarks>
+    public int MaxQueuedForwardsPerModel { get; set; }
+
+    /// <summary>
+    /// Longest a queued request waits for a bulkhead slot before it is refused with 429.
+    /// </summary>
+    public int BulkheadQueueTimeoutSeconds { get; set; } = 30;
+
+    public int MaxTrackedResilienceModels { get; set; } = 1024;
+
+    /// <summary>
+    /// TCP connect deadline for a new upstream connection. Distinct from the header timeout: a
+    /// backend that is down should fail fast here rather than consuming the whole
+    /// <see cref="ForwardTimeoutSeconds"/> allowance per request while the breaker slowly notices.
+    /// </summary>
+    public int UpstreamConnectTimeoutSeconds { get; set; } = 10;
+
+    /// <summary>
+    /// How long a pooled upstream connection may be reused before it is retired and re-established
+    /// (so DNS / load-balancer changes are picked up). 0 = never retire on age.
+    /// </summary>
+    public int UpstreamPooledConnectionLifetimeSeconds { get; set; } = 900;
+
+    /// <summary>
+    /// How long an idle pooled upstream connection is kept warm. Longer than the runtime default of
+    /// 60 s so bursty traffic reuses connections instead of paying a TCP handshake per burst.
+    /// </summary>
+    public int UpstreamPooledConnectionIdleTimeoutSeconds { get; set; } = 300;
+
+    /// <summary>
+    /// Cap on concurrent HTTP/1.1 connections to a single upstream host. 0 = unlimited (the
+    /// bulkhead is the intended concurrency control, so a second, hidden cap here is normally
+    /// undesirable). Set only when the model server itself is known to misbehave past a certain
+    /// connection count.
+    /// </summary>
+    public int UpstreamMaxConnectionsPerServer { get; set; }
+
+    public int CircuitBreakerFailureThreshold { get; set; } = 5;
+
+    public int CircuitBreakerBreakDurationSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// How long the single half-open probe may run without reporting an outcome before its permit is
+    /// reclaimed and the next caller is admitted.
+    /// </summary>
+    /// <remarks>
+    /// While a probe holds the permit the breaker refuses every other request for that model. Here a
+    /// probe is a whole inference, which can legitimately take minutes, so without a deadline a
+    /// tripped breaker stayed shut for the probe's duration rather than for
+    /// <see cref="CircuitBreakerBreakDurationSeconds"/> — one slow generation kept a working model
+    /// out of service for every caller. Raise it if probes are expected to be long and you would
+    /// rather test the backend more conservatively; lower it to resume traffic sooner.
+    /// </remarks>
+    public int CircuitBreakerHalfOpenProbeTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// How far back the breaker counts outcomes when deciding whether a backend is failing.
+    /// </summary>
+    /// <remarks>
+    /// Outcomes are counted over this rolling window rather than requiring an unbroken run of
+    /// failures. A backend failing intermittently — the usual way an overloaded model server
+    /// degrades — never produced a long enough consecutive run to trip the old counter, so the
+    /// breaker only ever caught backends that were completely down.
+    /// </remarks>
+    public int CircuitBreakerSamplingWindowSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// Fraction of outcomes in the window that must be failures before the breaker opens, applied in
+    /// addition to <see cref="CircuitBreakerFailureThreshold"/>. Guards a high-throughput backend
+    /// against being opened by an absolute count that it reaches while still mostly succeeding.
+    /// </summary>
+    public double CircuitBreakerFailureRatioThreshold { get; set; } = 0.5;
+
+    /// <summary>
+    /// Distinct callers (API keys, or client address blocks for keyless traffic) whose requests must
+    /// have failed inside the sampling window before the breaker opens. 1 restores the behaviour
+    /// before this setting existed.
+    /// </summary>
+    /// <remarks>
+    /// An open breaker refuses every caller of the model, so the failures of one caller are not
+    /// enough while another caller is being answered. When fewer callers than this used the model in
+    /// the window the requirement is waived, so a model with a single caller still trips.
+    /// </remarks>
+    public int CircuitBreakerMinFailingCallers { get; set; } = 2;
+}

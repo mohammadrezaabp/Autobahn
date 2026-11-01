@@ -1,0 +1,58 @@
+/* Loaded with the provider pages only, so the console's first stylesheet does not grow with them.
+   Tokens, tables, cards, chips and notices come from app.css. pv-prefixed. */
+
+.pv-back {
+  display: inline-flex; align-items: center; gap: var(--space-2);
+  margin-bottom: var(--space-3); font-size: var(--text-sm);
+  color: var(--text-secondary); text-decoration: none;
+}
+.pv-back:hover { color: var(--accent-text); }
+.pv-back .icon svg { width: 15px; height: 15px; }
+
+.pv-title { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+.pv-inline-title { margin: 0; font-size: var(--text-md); font-weight: var(--fw-semi); }
+
+.pv-row { cursor: pointer; }
+.pv-row:hover td { background: var(--bg-hover); }
+.pv-row:hover .cell-actions .icon-btn { color: var(--accent-text); }
+
+.pv-name { display: flex; align-items: center; gap: var(--space-2); font-weight: var(--fw-semi); color: var(--text-primary); min-width: 0; }
+.pv-sub { display: block; font-size: var(--text-2xs); color: var(--text-secondary); font-weight: var(--fw-normal); margin-top: 0.1rem; }
+.pv-sub code { font-size: inherit; white-space: nowrap; }
+.pv-closed { color: var(--text-tertiary); }
+.pv-low { color: var(--warn); }
+
+/* Headline answers: label over value, wrapping to two columns on a phone. */
+.pv-stats {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-4) var(--space-5); margin: 0 0 var(--space-4);
+}
+.pv-stat { display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; }
+.pv-stat dt {
+  color: var(--text-tertiary); font-family: var(--font-mono); font-size: var(--text-2xs);
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.pv-stat dd {
+  margin: 0; font-family: var(--font-mono); font-size: var(--text-lg); font-weight: var(--fw-semi);
+  font-variant-numeric: tabular-nums; line-height: 1.25; color: var(--text-primary);
+}
+.pv-stat dd.is-warn { color: var(--warn); }
+
+.pv-cap { width: 8rem; max-width: 100%; }
+.pv-tick { width: 3.5rem; }
+.pv-added td { color: var(--text-secondary); }
+.pv-catalog { max-height: 28rem; overflow-y: auto; }
+
+/* The sentence saying what a pending change will do, under the row it belongs to. */
+.pv-change td {
+  padding-top: 0; border-top: none;
+  font-size: var(--text-xs); color: var(--accent-text); background: var(--accent-softer);
+}
+
+/* The shared sparkline is drawn behind a vital tile; here it stands in the flow as the chart. */
+.pv-trend.vital-spark { position: static; height: 5rem; margin-top: var(--space-3); opacity: 1; }
+.pv-trend-axis { display: flex; justify-content: space-between; max-width: none; margin-top: 0.2rem; }
+
+@media (max-width: 720px) {
+  .pv-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

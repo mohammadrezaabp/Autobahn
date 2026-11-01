@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" />
+    <ProjectReference Include="../Autobahn.Application/Autobahn.Application.csproj" />
+    <ProjectReference Include="../Autobahn.Domain/Autobahn.Domain.csproj" />
+  </ItemGroup>
+</Project>

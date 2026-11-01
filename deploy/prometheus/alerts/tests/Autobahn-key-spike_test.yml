@@ -1,0 +1,107 @@
+# promtool test rules deploy/prometheus/alerts/tests/Autobahn-key-spike_test.yml
+#
+# One key's requests or tokens jumping: GatewayKeyRequestSpike and GatewayKeyTokenSpike. Counters
+# are `start+step x n` at a one-minute interval; a second segment starts where the jump begins.
+rule_files:
+  - ../Autobahn.yml
+
+evaluation_interval: 1m
+
+tests:
+  # The 2026-10-12 pattern: a key that sent a few requests a minute goes to 400 a minute on one
+  # model. A key that is always busy is not reported, and neither is a series that names no key.
+  - name: a quiet key jumping to 400 a minute is a request spike
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="DeepSeek-V4.1-Flash",status="success",tenant="personal-keys",key="bv-dev"}'
+        values: '0+1x60 460+400x9'
+      - series: 'gateway_inference_requests_total{model="Gemma-4-31B-IT",status="success",tenant="personal-keys",key="bv-dev"}'
+        values: '0+10x69'
+      - series: 'gateway_inference_requests_total{model="DeepSeek-V4.1-Flash",status="success",tenant="easy",key="easy-prod-main"}'
+        values: '0+200x69'
+      - series: 'gateway_inference_requests_total{model="DeepSeek-V4.1-Flash",status="success"}'
+        values: '0+5x60 305+300x9'
+    alert_rule_test:
+      # Over the floor since 62m, held 2 minutes: not yet.
+      - eval_time: 63m
+        alertname: GatewayKeyRequestSpike
+        exp_alerts: []
+      - eval_time: 66m
+        alertname: GatewayKeyRequestSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              tenant: personal-keys
+              key: bv-dev
+            exp_annotations:
+              summary: Key bv-dev of tenant personal-keys is sending 410 requests a minute
+              description: >-
+                Key bv-dev of tenant personal-keys averaged 410 requests a minute over the last
+                5 minutes, at least twice its rate over the hour before. By model:
+                DeepSeek-V4.1-Flash 400/min; Gemma-4-31B-IT 10/min
+              runbook: docs/runbooks/rate-limit-admin.md#key-spike
+
+  # A key with no requests in the hour before is compared with zero, so its first burst counts.
+  - name: a new key bursting is a request spike
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="Qwen3.8-27B",status="success",tenant="fanus",key="campaign"}'
+        values: '_x60 0+150x9'
+    alert_rule_test:
+      - eval_time: 67m
+        alertname: GatewayKeyRequestSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              tenant: fanus
+              key: campaign
+            exp_annotations:
+              summary: Key campaign of tenant fanus is sending 150 requests a minute
+              description: >-
+                Key campaign of tenant fanus averaged 150 requests a minute over the last
+                5 minutes, at least twice its rate over the hour before. By model:
+                Qwen3.8-27B 150/min
+              runbook: docs/runbooks/rate-limit-admin.md#key-spike
+
+  # 450 requests in one minute, then back to 10: the 5-minute average stays under 120.
+  - name: a one-minute blip is not a request spike
+    interval: 1m
+    input_series:
+      - series: 'gateway_inference_requests_total{model="DeepSeek-V4.1-Flash",status="success",tenant="personal-keys",key="bv-dev"}'
+        values: '0+10x60 1050+10x9'
+    alert_rule_test:
+      - eval_time: 64m
+        alertname: GatewayKeyRequestSpike
+        exp_alerts: []
+      - eval_time: 66m
+        alertname: GatewayKeyRequestSpike
+        exp_alerts: []
+
+  # Only direction="total" is counted: input and output are parts of it, not more tokens.
+  - name: a key jumping to 6 million tokens a minute is a token spike
+    interval: 1m
+    input_series:
+      - series: 'gateway_tokens_total{model="DeepSeek-V4.1-Flash",direction="total",tenant="autobahn-app",key="autobahn-App-Core"}'
+        values: '0+1000000x60 66000000+6000000x9'
+      - series: 'gateway_tokens_total{model="DeepSeek-V4.1-Flash",direction="input",tenant="autobahn-app",key="autobahn-App-Core"}'
+        values: '0+900000x60 59400000+5800000x9'
+      - series: 'gateway_tokens_total{model="Gemma-4-31B-IT",direction="total",tenant="easy",key="easy-prod-main"}'
+        values: '0+5000000x69'
+    alert_rule_test:
+      - eval_time: 63m
+        alertname: GatewayKeyTokenSpike
+        exp_alerts: []
+      - eval_time: 66m
+        alertname: GatewayKeyTokenSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              tenant: autobahn-app
+              key: autobahn-App-Core
+            exp_annotations:
+              summary: Key autobahn-App-Core of tenant autobahn-app is using 6M tokens a minute
+              description: >-
+                Key autobahn-App-Core of tenant autobahn-app averaged 6M tokens a minute over the last
+                5 minutes, at least twice its rate over the hour before. By model:
+                DeepSeek-V4.1-Flash 6M/min
+              runbook: docs/runbooks/rate-limit-admin.md#key-spike

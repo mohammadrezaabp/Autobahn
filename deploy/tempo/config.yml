@@ -1,0 +1,31 @@
+# One Tempo process keeping traces on the tempo-data volume. The gateway sends OTLP over HTTP to
+# :4318 (gRPC on :4317 is open too); Grafana reads from :3200. Started with -config.expand-env=true.
+
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+# Tempo deletes blocks older than this by itself. A trace is for looking at one slow or failed
+# request soon after it happened, so a week is the default (TRACE_RETENTION).
+compactor:
+  compaction:
+    block_retention: ${TRACE_RETENTION:-168h}
+
+usage_report:
+  reporting_enabled: false

@@ -1,0 +1,178 @@
+using System.Security.Claims;
+using System.Text.Encodings.Web;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Autobahn.Application.Abstractions;
+using Autobahn.Domain.Identity;
+using Autobahn.Application.Security;
+using Autobahn.Application.Errors;
+using Autobahn.Security.Errors;
+using Autobahn.Security.Identity;
+
+namespace Autobahn.Security.Authentication;
+
+public sealed class ApiKeyAuthenticationHandler : AuthenticationHandler<AuthenticationSchemeOptions>
+{
+    private readonly IApiKeyValidator _validator;
+    private readonly IGatewayAuthenticationState _authState;
+    private readonly IErrorResponseWriter _errors;
+
+    public ApiKeyAuthenticationHandler(
+        IOptionsMonitor<AuthenticationSchemeOptions> options,
+        ILoggerFactory logger,
+        UrlEncoder encoder,
+        IApiKeyValidator validator,
+        IGatewayAuthenticationState authState,
+        IErrorResponseWriter errors)
+        : base(options, logger, encoder)
+    {
+        _validator = validator;
+        _authState = authState;
+        _errors = errors;
+    }
+
+    protected override async Task<AuthenticateResult> HandleAuthenticateAsync()
+    {
+        if (PublicGatewayPaths.IsAnonymous(Request.Path))
+        {
+            return AuthenticateResult.NoResult();
+        }
+
+        var isPublicInference = PublicModelAccess.IsPublicInferenceRequest(Context);
+        var allowsAnonymousModelsListing = PublicModelAccess.AllowsAnonymousModelsListing(Context);
+
+        var apiKey = ExtractApiKey(Request);
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            if (isPublicInference || allowsAnonymousModelsListing)
+            {
+                return AuthenticateResult.NoResult();
+            }
+
+            return _authState.IsAuthenticationRequired
+                ? AuthenticateResult.Fail("missing_api_key")
+                : AuthenticateResult.NoResult();
+        }
+
+        var result = await _validator.ValidateAsync(apiKey, Context.RequestAborted).ConfigureAwait(false);
+        if (!result.IsSuccess)
+        {
+            if (!_authState.IsAuthenticationRequired)
+            {
+                return AuthenticateResult.NoResult();
+            }
+
+            var failure = result.Failure ?? ApiKeyValidationFailure.Invalid;
+
+            // On the anonymous-capable routes an unrecognised key is treated as no key at all.
+            // OpenAI-compatible SDKs refuse to construct a client with an empty api_key, so nearly
+            // every caller of a public model sends a placeholder ("lm-studio", "not-needed", ...);
+            // rejecting those made publicAccess unusable from the very clients it exists to serve,
+            // and it costs nothing to ignore them because the route grants anonymous callers the
+            // same access anyway.
+            //
+            // A key the gateway does recognise is the opposite case and still fails loudly here:
+            // answering 200 to a revoked, expired, or deactivated-tenant key would leave its holder
+            // believing the credential still works, with no signal anywhere that it had stopped.
+            if ((isPublicInference || allowsAnonymousModelsListing) && !failure.IsRecognizedCredential())
+            {
+                return AuthenticateResult.NoResult();
+            }
+
+            var code = failure switch
+            {
+                ApiKeyValidationFailure.Expired => "expired_api_key",
+                _ => "invalid_api_key",
+            };
+
+            Context.Items[GatewayAuthContextItems.AuthFailureCode] = code;
+            return AuthenticateResult.Fail(code);
+        }
+
+        return Success(result);
+    }
+
+    private AuthenticateResult Success(ApiKeyValidationResult result)
+    {
+        var claims = new List<Claim>
+        {
+            new(GatewayAuthClaims.TenantId, result.TenantId!.Value.ToString()),
+            new(GatewayAuthClaims.ApiKeyId, result.ApiKeyId!.Value.ToString()),
+            new(GatewayAuthClaims.Role, result.Role!.Value.ToString()),
+        };
+
+        if (!string.IsNullOrWhiteSpace(result.TenantSlug))
+        {
+            claims.Add(new Claim(GatewayAuthClaims.TenantSlug, result.TenantSlug));
+        }
+
+        var identity = new ClaimsIdentity(claims, GatewayAuthSchemes.ApiKey);
+        var principal = new ClaimsPrincipal(identity);
+        var ticket = new AuthenticationTicket(principal, GatewayAuthSchemes.ApiKey);
+
+        Context.SetTenantContext(new TenantContext
+        {
+            TenantId = result.TenantId!.Value.ToString(),
+            ApiKeyId = result.ApiKeyId!.Value.ToString(),
+            ApiKeyLabel = result.ApiKeyLabel,
+            TenantSlug = result.TenantSlug,
+            PlanSlug = result.PlanSlug,
+            CostCenter = result.CostCenter,
+            Role = result.Role!.Value,
+        });
+
+        return AuthenticateResult.Success(ticket);
+    }
+
+    protected override async Task HandleChallengeAsync(AuthenticationProperties properties)
+    {
+        // Anonymous paths challenge nothing. "Authentication disabled" is no longer a reason to skip
+        // the body: in that mode the Inference policy succeeds without a credential, so the only
+        // challenges left are Admin and Operator — control-plane denials, which must carry the same
+        // OpenAI-shaped error body as every other 401 rather than an empty response.
+        if (PublicGatewayPaths.IsAnonymous(Request.Path))
+        {
+            return;
+        }
+
+        var errorCode = Context.Items.TryGetValue(GatewayAuthContextItems.AuthFailureCode, out var value) &&
+                        value?.ToString() == "expired_api_key"
+            ? GatewayErrorCode.ExpiredApiKey
+            : GatewayErrorCode.InvalidApiKey;
+
+        // The one signal the auth-failure limiter charges on. Set here, where the 401 is actually
+        // written, so a challenge that returns early above (an anonymous path) charges nothing.
+        Context.Items[GatewayAuthContextItems.CredentialRejected] = true;
+
+        await Context.WriteGatewayErrorAsync(
+            _errors.Write(errorCode),
+            Context.RequestAborted).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Authenticated but not authorized (e.g. a tenant admin on an operator-only route). The default
+    /// forbid is an empty 403; clients of this gateway expect the OpenAI-shaped error body.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not marked as a credential rejection: the key was recognised and is usable, it
+    /// simply does not hold the role or tenant the route needs. There is nothing to guess here, so
+    /// there is nothing for the auth-failure budget to bound.
+    /// </remarks>
+    protected override async Task HandleForbiddenAsync(AuthenticationProperties properties)
+    {
+        await Context.WriteGatewayErrorAsync(
+            _errors.Write(GatewayErrorCode.InsufficientScope),
+            Context.RequestAborted).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Reads the credential through <see cref="GatewayCredential"/>, which the proxy layer also uses
+    /// to decide whether a request presents one — the two must never disagree about that.
+    /// </summary>
+    private static string? ExtractApiKey(HttpRequest request) =>
+        GatewayCredential.Extract(
+            request.Headers[GatewayCredential.ApiKeyHeader].ToString(),
+            request.Headers.Authorization.ToString());
+}

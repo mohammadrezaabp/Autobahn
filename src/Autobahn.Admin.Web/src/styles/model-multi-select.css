@@ -1,0 +1,30 @@
+/* A menu to tick several models in (a key's model access). */
+.msel { position: relative; margin-bottom: var(--space-4); }
+.msel-trigger { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); width: 100%; min-height: 36px; padding: 0.45rem 0.7rem; border: 1px solid var(--border-strong); border-radius: var(--r-md); background: var(--bg-surface); font: inherit; font-size: var(--text-sm); color: var(--text-primary); text-align: left; cursor: pointer; }
+.msel-trigger:hover { border-color: var(--accent-border); }
+.msel-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.msel-trigger .icon { color: var(--text-tertiary); }
+.msel-trigger .icon svg { width: 15px; height: 15px; }
+.msel-menu { position: absolute; z-index: 5; left: 0; right: 0; top: calc(36px + 0.25rem); padding: var(--space-3); border: 1px solid var(--border-strong); border-radius: var(--r-md); background: var(--bg-elevated); box-shadow: var(--shadow-lg); }
+.msel-menu .msel-filter { margin: 0; }
+.msel-actions { display: flex; align-items: center; gap: var(--space-3); margin: var(--space-2) 0; }
+.msel-actions .spacer { flex: 1; }
+.msel-options { max-height: 18rem; overflow: auto; }
+.msel-option { margin: 0; padding: 0.3rem 0.4rem; border-radius: var(--r-sm); min-width: 0; }
+.msel-option:hover { background: var(--bg-hover); }
+.msel-option.disabled { cursor: not-allowed; color: var(--text-tertiary); }
+.msel-option .tag { margin-left: auto; flex: none; max-width: none; }
+.msel-option .tag + .tag { margin-left: 0; }
+/* The key access editor around the menu. */
+.ka-step { margin: var(--space-4) 0 0; font-size: var(--text-sm); }
+.ka-prefix { display: flex; gap: var(--space-2); margin-top: var(--space-3); }
+.ka-prefix input { flex: 1; margin: 0; }
+.ka-cap { display: flex; align-items: center; gap: var(--space-3); margin: var(--space-2) 0 0 1.6rem; }
+.ka-cap label { margin: 0; font-size: var(--text-xs); color: var(--text-secondary); white-space: nowrap; }
+.ka-cap input { width: 9rem; margin: 0; }
+.msel-id { font-family: var(--font-mono); font-size: var(--text-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.msel-chips { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: var(--space-2) 0 0; padding: 0; list-style: none; }
+.msel-chip { display: inline-flex; align-items: center; gap: 0.25rem; }
+.msel-chip button { display: inline-flex; padding: 0; border: none; background: none; color: inherit; cursor: pointer; border-radius: var(--r-xs); }
+.msel-chip button svg { width: 11px; height: 11px; }
+.msel-chip button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }

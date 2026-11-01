@@ -1,0 +1,204 @@
+using Autobahn.Observability.Metrics;
+using Autobahn.Observability.Policy;
+using Autobahn.Observability.Runtime;
+
+namespace Autobahn.Observability.Tests.Metrics;
+
+public sealed class GatewayMetricsCollectorTests
+{
+    [Fact]
+    public void RecordRateLimitRejection_IncrementsRuntimeCounter()
+    {
+        var runtime = new GatewayRuntimeState();
+        var collector = new GatewayMetricsCollector(runtime);
+
+        collector.RecordRateLimitRejection("rpm");
+
+        runtime.GetStats().RateLimit.Should().Be(1);
+    }
+
+    [Fact]
+    public void RecordTimeToFirstToken_FeedsTheWindowedStatistics()
+    {
+        var runtime = new GatewayRuntimeState();
+        var collector = new GatewayMetricsCollector(runtime);
+
+        collector.RecordTimeToFirstToken("gpt-4o", seconds: 0.2);
+
+        var window = runtime.Windows.GetWindow(TimeSpan.FromMinutes(5));
+        window.TtftSamples.Should().Be(1);
+        window.TtftP95Ms.Should().NotBeNull().And.BeInRange(100, 250);
+    }
+
+    [Fact]
+    public void RecordQuotaRejection_IncrementsRuntimeCounter()
+    {
+        var runtime = new GatewayRuntimeState();
+        var collector = new GatewayMetricsCollector(runtime);
+
+        collector.RecordQuotaRejection();
+
+        runtime.GetStats().Quota.Should().Be(1);
+    }
+
+    [Fact]
+    public void RecordTokenUsage_DoesNotThrow()
+    {
+        var runtime = new GatewayRuntimeState();
+        var collector = new GatewayMetricsCollector(runtime);
+
+        var act = () => collector.RecordTokenUsage("m1", 3, 7);
+
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void RecordTimeToFirstToken_DoesNotThrow()
+    {
+        var runtime = new GatewayRuntimeState();
+        var collector = new GatewayMetricsCollector(runtime);
+
+        var act = () => collector.RecordTimeToFirstToken("m1", 0.12);
+
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void RecordUsageParseFailure_DoesNotThrow()
+    {
+        var collector = new GatewayMetricsCollector(new GatewayRuntimeState());
+        var act = () => collector.RecordUsageParseFailure("m1");
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void RecordEstimatedUsage_DoesNotThrow()
+    {
+        var collector = new GatewayMetricsCollector(new GatewayRuntimeState());
+        var act = () => collector.RecordEstimatedUsage("m1");
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void RecordUnsplitUsage_DoesNotThrow()
+    {
+        var collector = new GatewayMetricsCollector(new GatewayRuntimeState());
+        var act = () => collector.RecordUnsplitUsage("m1");
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void RecordInferenceRouted_DoesNotThrow()
+    {
+        var collector = new GatewayMetricsCollector(new GatewayRuntimeState());
+        var act = () => collector.RecordInferenceRouted("m1", "chat", isStreaming: true);
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void RecordForwardAttempt_DoesNotThrow()
+    {
+        var collector = new GatewayMetricsCollector(new GatewayRuntimeState());
+        var act = () => collector.RecordForwardAttempt("m1", "success");
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void RecordModelResolve_DoesNotThrow()
+    {
+        var collector = new GatewayMetricsCollector(new GatewayRuntimeState());
+        var act = () => collector.RecordModelResolve("hit");
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void RecordCircuitBreakerTransition_DoesNotThrow()
+    {
+        var collector = new GatewayMetricsCollector(new GatewayRuntimeState());
+        var act = () => collector.RecordCircuitBreakerTransition("m1", "open");
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void RecordBulkheadRejection_DoesNotThrow()
+    {
+        var collector = new GatewayMetricsCollector(new GatewayRuntimeState());
+        var act = () => collector.RecordBulkheadRejection("m1");
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void RecordBulkheadInflightChange_DoesNotThrow()
+    {
+        var collector = new GatewayMetricsCollector(new GatewayRuntimeState());
+        var act = () => collector.RecordBulkheadInflightChange("m1", 1);
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void RecordUsageEventsDropped_AddsToTheWriterDroppedCounter()
+    {
+        var collector = new GatewayMetricsCollector(new GatewayRuntimeState());
+        long observed = 0;
+        using var listener = new System.Diagnostics.Metrics.MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (ReferenceEquals(instrument, GatewayMeters.UsageWriterDropped))
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, value, _, _) => Interlocked.Add(ref observed, value));
+        listener.Start();
+
+        collector.RecordUsageEventsDropped(3);
+        collector.RecordUsageEventsDropped(0);
+
+        observed.Should().Be(3);
+    }
+
+    [Fact]
+    public void RecordBillingReconciliation_DoesNotThrow()
+    {
+        var collector = new GatewayMetricsCollector(new GatewayRuntimeState());
+        var act = () => collector.RecordBillingReconciliation(2, 1.25);
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void DimensionedRejections_FeedTheRuntimeWindowsAndThePolicyTracker()
+    {
+        var runtime = new GatewayRuntimeState();
+        var tracker = new PolicyPressureTracker();
+        var collector = new GatewayMetricsCollector(runtime, tracker);
+
+        collector.RecordRateLimitRejection("RateLimitExceeded", "tenant-a", null);
+        collector.RecordRateLimitRejection("stream_concurrency", "tenant-a", "m1");
+        collector.RecordQuotaRejection("tenant-b", null);
+        collector.RecordBudgetRejection("tenant-b", "Ops", "m1");
+        collector.RecordGrantDenial("tenant-c", "m2");
+        collector.RecordModelResolve("not_found", "nope");
+
+        var stats = runtime.GetStats();
+        stats.RateLimit.Should().Be(2);
+        stats.Quota.Should().Be(2, "a budget hard stop is a quota-style refusal");
+        stats.Total.Should().Be(0, "none of these are counted as requests here");
+
+        var window = runtime.Windows.GetWindow(TimeSpan.FromMinutes(5));
+        window.RejectionsByReason.Should().Equal(new Dictionary<string, long>
+        {
+            ["rate_limit"] = 1,
+            ["stream_concurrency"] = 1,
+            ["quota"] = 1,
+            ["budget"] = 1,
+            ["model_not_found"] = 1,
+        });
+
+        var policy = tracker.Snapshot();
+        policy.RejectionsByTenant1h.Select(r => r.Key).Should().Contain(["tenant-a", "tenant-b", "tenant-c"]);
+        policy.UnknownModels1h.Should().ContainSingle(r => r.Key == "nope");
+        policy.GrantDenials1h.Should().ContainSingle(r => r.Key == "tenant-c|m2");
+        policy.BudgetRejections1h.Should().ContainSingle(r => r.Key == "Ops");
+    }
+
+}

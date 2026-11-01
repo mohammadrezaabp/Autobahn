@@ -1,0 +1,60 @@
+// Sends the gateway's per-request lines to Splunk over the HTTP Event Collector.
+//
+// Copy to splunk.alloy (not committed), set SPLUNK_HEC_URL, SPLUNK_HEC_TOKEN and SPLUNK_INDEX in
+// .env, and recreate the alloy container. Alloy loads it beside config.alloy; Loki keeps
+// receiving everything as before.
+//
+// Only the `inference_request` lines are sent: one per inference request, with request_id,
+// tenant, key, model, status, outcome, limit_decision, limit_scope, upstream_status and
+// duration_ms as name=value pairs, which Splunk extracts as fields at search time. This reads
+// the gateway's output a second time, with read positions of its own.
+
+discovery.relabel "splunk_gateway" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = "gateway"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+loki.source.docker "splunk_gateway" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.splunk_gateway.output
+  forward_to = [loki.process.splunk_requests.receiver]
+}
+
+loki.process "splunk_requests" {
+  forward_to = [otelcol.receiver.loki.splunk.receiver]
+
+  stage.match {
+    selector = "{service=\"gateway\"} !~ \"inference_request \""
+    action   = "drop"
+  }
+}
+
+otelcol.receiver.loki "splunk" {
+  output {
+    logs = [otelcol.exporter.splunkhec.splunk.input]
+  }
+}
+
+otelcol.exporter.splunkhec "splunk" {
+  client {
+    // For example https://splunk.example.com:8088/services/collector
+    endpoint = sys.env("SPLUNK_HEC_URL")
+  }
+
+  splunk {
+    token      = sys.env("SPLUNK_HEC_TOKEN")
+    index      = sys.env("SPLUNK_INDEX")
+    source     = "Autobahn-gateway"
+    sourcetype = "Autobahn:inference_request"
+  }
+}

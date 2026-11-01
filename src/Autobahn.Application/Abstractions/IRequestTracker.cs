@@ -1,0 +1,49 @@
+using Autobahn.Application.Observability;
+
+namespace Autobahn.Application.Abstractions;
+
+public interface IRequestTracker
+{
+    /// <summary>
+    /// Called when an inference request is about to be forwarded (Phase 4 metrics hook).
+    /// </summary>
+    IInferenceRequestScope BeginInferenceRequest(string modelId, bool isStreaming);
+
+    /// <summary>
+    /// As <see cref="BeginInferenceRequest(string, bool)"/>, also attributing the request to a tenant
+    /// for the Overview's per-tenant activity. The default keeps older implementations working.
+    /// </summary>
+    IInferenceRequestScope BeginInferenceRequest(string modelId, bool isStreaming, string? tenantId) =>
+        BeginInferenceRequest(modelId, isStreaming);
+
+    /// <summary>
+    /// As above, also naming the caller on the request, error and duration series. The default
+    /// keeps older implementations working.
+    /// </summary>
+    IInferenceRequestScope BeginInferenceRequest(
+        string modelId,
+        bool isStreaming,
+        string? tenantId,
+        MetricCaller caller) =>
+        BeginInferenceRequest(modelId, isStreaming, tenantId);
+
+    /// <summary>
+    /// Records a request the gateway answered with an error before it ever reached the upstream —
+    /// an unhealthy backend, an open circuit, a full bulkhead or an exhausted stream slot.
+    /// </summary>
+    /// <remarks>
+    /// These never open an <see cref="IInferenceRequestScope"/>, so before this existed they reached
+    /// the client as a 429/502/503 but left no trace on the dashboard: during a saturation incident
+    /// the console showed a calm, error-free gateway. Latency is deliberately not contributed —
+    /// admission takes microseconds and would drag the mean toward zero.
+    /// </remarks>
+    void RecordRejectedRequest(string modelId, string errorCode);
+
+    /// <inheritdoc cref="RecordRejectedRequest(string, string)"/>
+    void RecordRejectedRequest(string modelId, string errorCode, MetricCaller caller) =>
+        RecordRejectedRequest(modelId, errorCode);
+
+    /// <summary>As above, naming the model's provider on the request and error series.</summary>
+    void RecordRejectedRequest(string modelId, string errorCode, MetricCaller caller, string provider) =>
+        RecordRejectedRequest(modelId, errorCode, caller);
+}

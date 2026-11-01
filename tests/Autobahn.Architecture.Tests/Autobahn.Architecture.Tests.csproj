@@ -1,0 +1,18 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="NetArchTest.Rules" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Autobahn.Host\Autobahn.Host.csproj" />
+    <ProjectReference Include="..\..\src\Autobahn.Application\Autobahn.Application.csproj" />
+    <ProjectReference Include="..\..\src\Autobahn.Api\Autobahn.Api.csproj" />
+    <ProjectReference Include="..\..\src\Autobahn.Proxy\Autobahn.Proxy.csproj" />
+    <ProjectReference Include="..\..\src\Autobahn.Security\Autobahn.Security.csproj" />
+    <ProjectReference Include="..\..\src\Autobahn.Policy\Autobahn.Policy.csproj" />
+    <ProjectReference Include="..\..\src\Autobahn.Observability\Autobahn.Observability.csproj" />
+    <ProjectReference Include="..\..\src\Autobahn.Billing\Autobahn.Billing.csproj" />
+    <ProjectReference Include="..\..\src\Autobahn.Persistence\Autobahn.Persistence.csproj" />
+    <ProjectReference Include="..\..\src\Autobahn.Registry\Autobahn.Registry.csproj" />
+    <ProjectReference Include="..\..\src\Autobahn.OperatorConsole\Autobahn.OperatorConsole.csproj" />
+  </ItemGroup>
+</Project>

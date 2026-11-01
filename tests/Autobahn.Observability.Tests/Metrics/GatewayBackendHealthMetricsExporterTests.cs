@@ -1,0 +1,114 @@
+using Autobahn.Application.Abstractions;
+using Autobahn.Domain.Models;
+using Autobahn.Observability.Metrics;
+
+namespace Autobahn.Observability.Tests.Metrics;
+
+public sealed class GatewayBackendHealthMetricsExporterTests
+{
+    [Fact]
+    public void ObserveMeasurements_ReflectsBackendHealthPerModel()
+    {
+        var registry = new FakeModelRegistry(
+        [
+            new ModelConfig { Id = "healthy-model", Url = "http://localhost:1" },
+            new ModelConfig { Id = "sick-model", Url = "http://localhost:2" },
+        ]);
+        var healthStore = new FakeBackendHealthStore();
+        healthStore.SetHealthy("healthy-model", true);
+        healthStore.SetHealthy("sick-model", false);
+
+        var measurements = GatewayBackendHealthMetricsExporter
+            .ObserveMeasurements(registry, healthStore)
+            .ToList();
+
+        measurements.Should().HaveCount(2);
+        measurements.Should().Contain(m => m.Value == 1);
+        measurements.Should().Contain(m => m.Value == 0);
+    }
+
+    /// <summary>
+    /// The GW-02c regression. The per-model gauge emits nothing for an empty registry, so
+    /// <c>max(gateway_backend_health) == 0</c> — the outage alert — had no samples to evaluate and
+    /// silently never fired for the one state that most needs it: a gateway able to serve nothing.
+    /// The count is always present.
+    /// </summary>
+    [Fact]
+    public void ObserveConfiguredModels_EmptyRegistry_StillEmitsASeries()
+    {
+        var registry = new FakeModelRegistry([]);
+
+        GatewayBackendHealthMetricsExporter.ObserveMeasurements(registry, new FakeBackendHealthStore())
+            .Should().BeEmpty("the per-model gauge has nothing to say, which is the blindness");
+
+        var configured = GatewayBackendHealthMetricsExporter.ObserveConfiguredModels(registry).ToList();
+
+        configured.Should().ContainSingle();
+        configured[0].Value.Should().Be(0);
+    }
+
+    [Fact]
+    public void ObserveConfiguredModels_CountsServingRoutesOnly()
+    {
+        var registry = new FakeModelRegistry(
+        [
+            new ModelConfig { Id = "serving", Url = "http://localhost:1" },
+            new ModelConfig { Id = "also-serving", Url = "http://localhost:2" },
+            new ModelConfig { Id = "stopped", Url = "http://localhost:3", State = ModelRouteStates.Stopped },
+        ]);
+
+        var configured = GatewayBackendHealthMetricsExporter.ObserveConfiguredModels(registry).ToList();
+
+        configured.Should().ContainSingle();
+        configured[0].Value.Should().Be(2, "a stopped route is not one the gateway will serve");
+    }
+
+    [Fact]
+    public async Task StartAndStopAsync_CompleteSuccessfully()
+    {
+        var exporter = new GatewayBackendHealthMetricsExporter(
+            new FakeModelRegistry([]),
+            new FakeBackendHealthStore());
+
+        await exporter.StartAsync(CancellationToken.None);
+        await exporter.StopAsync(CancellationToken.None);
+    }
+
+    private sealed class FakeModelRegistry(IReadOnlyList<ModelConfig> models) : IModelRegistry
+    {
+        public IReadOnlyList<ModelConfig> GetAllModels() => models;
+
+        public bool TryGetModel(string name, out ModelConfig? model)
+        {
+            model = models.FirstOrDefault(m =>
+                string.Equals(m.Id, name, StringComparison.OrdinalIgnoreCase) ||
+                m.Aliases.Any(a => string.Equals(a, name, StringComparison.OrdinalIgnoreCase)));
+            return model is not null;
+        }
+
+        public bool ModelExists(string name) => TryGetModel(name, out _);
+
+        public string? GetBackendUrl(string name) =>
+            TryGetModel(name, out var model) ? model!.Url : null;
+
+        public Task LoadModelsAsync(string configPath, CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+    }
+
+    private sealed class FakeBackendHealthStore : IBackendHealthStore
+    {
+        private readonly Dictionary<string, bool> _healthy = new(StringComparer.OrdinalIgnoreCase);
+
+        public void SetHealthy(string modelId, bool healthy) => _healthy[modelId] = healthy;
+
+        public bool IsBackendHealthy(string modelId) =>
+            _healthy.TryGetValue(modelId, out var healthy) && healthy;
+
+        public BackendHealth? GetHealth(string modelId) => null;
+
+        public IReadOnlyDictionary<string, BackendHealth> GetAllHealth() =>
+            new Dictionary<string, BackendHealth>();
+
+        public void SetHealth(BackendHealth health) => _healthy[health.ModelId] = health.IsHealthy;
+    }
+}

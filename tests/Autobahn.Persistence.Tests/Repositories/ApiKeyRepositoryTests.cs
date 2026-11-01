@@ -1,0 +1,342 @@
+using Autobahn.Domain.Identity;
+using Autobahn.Domain.RateLimiting;
+using Autobahn.Persistence.Repositories;
+using Autobahn.Persistence.Tests.Infrastructure;
+
+namespace Autobahn.Persistence.Tests.Repositories;
+
+public sealed class ApiKeyRepositoryTests
+{
+    [Fact]
+    public async Task CreateAsync_ThenFindByPrefix_ReturnsKey()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(nameof(CreateAsync_ThenFindByPrefix_ReturnsKey));
+        var tenantRepo = new TenantRepository(db);
+        var sut = new ApiKeyRepository(db);
+        var now = DateTimeOffset.UtcNow;
+        var tenantId = Guid.NewGuid();
+
+        await tenantRepo.CreateAsync(new TenantRecord(tenantId, "t1", "Tenant 1", null, null, true, now, now));
+
+        var key = new ApiKeyRecord(
+            Guid.NewGuid(),
+            tenantId,
+            "hash-value",
+            "sk-Autobahn-abc",
+            ApiKeyRole.Inference,
+            ["inference"],
+            null,
+            null,
+            now,
+            null);
+
+        await sut.CreateAsync(key);
+
+        var loaded = await sut.FindByPrefixAsync("sk-Autobahn-abc");
+
+        loaded.Should().NotBeNull();
+        loaded!.Role.Should().Be(ApiKeyRole.Inference);
+        loaded.Scopes.Should().Contain("inference");
+    }
+
+    [Fact]
+    public async Task FindByPrefixesAsync_MixedPrefixFormats_ReturnsEveryMatch()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(nameof(FindByPrefixesAsync_MixedPrefixFormats_ReturnsEveryMatch));
+        var tenantRepo = new TenantRepository(db);
+        var sut = new ApiKeyRepository(db);
+        var now = DateTimeOffset.UtcNow;
+        var tenantId = Guid.NewGuid();
+
+        await tenantRepo.CreateAsync(new TenantRecord(tenantId, "t1", "Tenant 1", null, null, true, now, now));
+        await sut.CreateAsync(CreateKey(tenantId, "legacy-hash", "sk-Autobahn-797", now));
+        await sut.CreateAsync(CreateKey(tenantId, "current-hash", "sk-Autobahn-797a8b0b67b", now));
+        await sut.CreateAsync(CreateKey(tenantId, "other-hash", "sk-Autobahn-000", now));
+
+        var loaded = await sut.FindByPrefixesAsync(["sk-Autobahn-797a8b0b67b", "sk-Autobahn-797"]);
+
+        loaded.Select(k => k.KeyHash).Should().BeEquivalentTo(["legacy-hash", "current-hash"]);
+    }
+
+    [Fact]
+    public async Task FindByPrefixesAsync_EmptyPrefixes_ReturnsEmpty()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(nameof(FindByPrefixesAsync_EmptyPrefixes_ReturnsEmpty));
+        var sut = new ApiKeyRepository(db);
+
+        var loaded = await sut.FindByPrefixesAsync([]);
+
+        loaded.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task FindByPrefixesAsync_NullPrefixes_Throws()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(nameof(FindByPrefixesAsync_NullPrefixes_Throws));
+        var sut = new ApiKeyRepository(db);
+
+        await Assert.ThrowsAsync<ArgumentNullException>(() => sut.FindByPrefixesAsync(null!));
+    }
+
+    private static ApiKeyRecord CreateKey(Guid tenantId, string hash, string prefix, DateTimeOffset now) =>
+        new(
+            Guid.NewGuid(),
+            tenantId,
+            hash,
+            prefix,
+            ApiKeyRole.Inference,
+            ["inference"],
+            null,
+            null,
+            now,
+            null);
+
+    [Fact]
+    public async Task RevokeAsync_SetsRevokedAt()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(nameof(RevokeAsync_SetsRevokedAt));
+        var tenantRepo = new TenantRepository(db);
+        var sut = new ApiKeyRepository(db);
+        var now = DateTimeOffset.UtcNow;
+        var tenantId = Guid.NewGuid();
+        var keyId = Guid.NewGuid();
+
+        await tenantRepo.CreateAsync(new TenantRecord(tenantId, "t1", "Tenant 1", null, null, true, now, now));
+        await sut.CreateAsync(new ApiKeyRecord(
+            keyId,
+            tenantId,
+            "hash",
+            "sk-prefix",
+            ApiKeyRole.Admin,
+            [],
+            null,
+            null,
+            now,
+            null));
+
+        var revokedAt = now.AddMinutes(5);
+        await sut.RevokeAsync(keyId, revokedAt);
+
+        var loaded = await sut.GetByIdAsync(keyId);
+        loaded!.RevokedAt.Should().Be(revokedAt);
+    }
+
+    [Fact]
+    public async Task UpdateMetadataAsync_PersistsFields()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(nameof(UpdateMetadataAsync_PersistsFields));
+        var tenantRepo = new TenantRepository(db);
+        var sut = new ApiKeyRepository(db);
+        var now = DateTimeOffset.UtcNow;
+        var tenantId = Guid.NewGuid();
+        var keyId = Guid.NewGuid();
+
+        await tenantRepo.CreateAsync(new TenantRecord(tenantId, "t1", "Tenant 1", null, null, true, now, now));
+        await sut.CreateAsync(new ApiKeyRecord(
+            keyId,
+            tenantId,
+            "hash",
+            "sk-prefix",
+            ApiKeyRole.Inference,
+            [],
+            null,
+            null,
+            now,
+            null));
+
+        var updated = await sut.UpdateMetadataAsync(
+            keyId,
+            new ApiKeyMetadataUpdate("prod-bot", "Platform team", "Notes", "eng-platform"));
+
+        updated.Label.Should().Be("prod-bot");
+        updated.Assignee.Should().Be("Platform team");
+        updated.Description.Should().Be("Notes");
+        updated.CostCenter.Should().Be("eng-platform");
+    }
+
+    [Fact]
+    public async Task TouchLastUsedAsync_SetsTimestamp()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(nameof(TouchLastUsedAsync_SetsTimestamp));
+        var tenantRepo = new TenantRepository(db);
+        var sut = new ApiKeyRepository(db);
+        var now = DateTimeOffset.UtcNow;
+        var tenantId = Guid.NewGuid();
+        var keyId = Guid.NewGuid();
+        var touchedAt = now.AddHours(1);
+
+        await tenantRepo.CreateAsync(new TenantRecord(tenantId, "t1", "Tenant 1", null, null, true, now, now));
+        await sut.CreateAsync(new ApiKeyRecord(
+            keyId,
+            tenantId,
+            "hash",
+            "sk-prefix",
+            ApiKeyRole.Inference,
+            [],
+            null,
+            null,
+            now,
+            null));
+
+        await sut.TouchLastUsedAsync(keyId, touchedAt);
+
+        var loaded = await sut.GetByIdAsync(keyId);
+        loaded!.LastUsedAt.Should().Be(touchedAt);
+    }
+
+    [Fact]
+    public async Task ArchiveAsync_SetsArchivedAt_AndListByTenantHidesItByDefault()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(nameof(ArchiveAsync_SetsArchivedAt_AndListByTenantHidesItByDefault));
+        var (sut, tenantId, keyId) = await SeedKeyAsync(db, nameof(ArchiveAsync_SetsArchivedAt_AndListByTenantHidesItByDefault));
+        var archivedAt = DateTimeOffset.UtcNow.AddMinutes(9);
+
+        await sut.RevokeAsync(keyId, DateTimeOffset.UtcNow);
+        await sut.ArchiveAsync(keyId, archivedAt);
+
+        (await sut.GetByIdAsync(keyId))!.ArchivedAt.Should().Be(archivedAt);
+        (await sut.ListByTenantAsync(tenantId)).Should().BeEmpty();
+        (await sut.ListByTenantAsync(tenantId, includeArchived: true)).Should().ContainSingle();
+    }
+
+    [Fact]
+    public async Task UnarchiveAsync_ClearsArchivedAt_ButLeavesTheKeyRevoked()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(nameof(UnarchiveAsync_ClearsArchivedAt_ButLeavesTheKeyRevoked));
+        var (sut, tenantId, keyId) = await SeedKeyAsync(db, nameof(UnarchiveAsync_ClearsArchivedAt_ButLeavesTheKeyRevoked));
+        var revokedAt = DateTimeOffset.UtcNow;
+
+        await sut.RevokeAsync(keyId, revokedAt);
+        await sut.ArchiveAsync(keyId, revokedAt.AddMinutes(1));
+        await sut.UnarchiveAsync(keyId);
+
+        var loaded = await sut.GetByIdAsync(keyId);
+        loaded!.ArchivedAt.Should().BeNull();
+        loaded.RevokedAt.Should().Be(revokedAt, "unarchiving files a key back into view, it does not revive the credential");
+        (await sut.ListByTenantAsync(tenantId)).Should().ContainSingle();
+    }
+
+    [Fact]
+    public async Task DeleteAsync_RemovesTheKeyAndItsModelGrants()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(nameof(DeleteAsync_RemovesTheKeyAndItsModelGrants));
+        var (sut, tenantId, keyId) = await SeedKeyAsync(db, nameof(DeleteAsync_RemovesTheKeyAndItsModelGrants));
+
+        db.ApiKeyModelGrants.Add(new Autobahn.Persistence.Entities.ApiKeyModelGrantEntity
+        {
+            Id = Guid.NewGuid(),
+            ApiKeyId = keyId,
+            ModelPattern = "gpt-*",
+            Effect = GrantEffect.Allow,
+        });
+        await db.SaveChangesAsync();
+
+        (await sut.DeleteAsync(keyId)).Should().BeTrue();
+
+        (await sut.GetByIdAsync(keyId)).Should().BeNull();
+        (await sut.ListByTenantAsync(tenantId, includeArchived: true)).Should().BeEmpty();
+        db.ApiKeyModelGrants.Should().BeEmpty("grants have no meaning without the key they were granted to");
+    }
+
+    [Fact]
+    public async Task DeleteAsync_AlsoClearsRateLimitRulesTargetingTheKey()
+    {
+        const string Name = nameof(DeleteAsync_AlsoClearsRateLimitRulesTargetingTheKey);
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(Name);
+        var (sut, _, keyId) = await SeedKeyAsync(db, Name);
+
+        var otherKeyId = Guid.NewGuid();
+        db.RateLimitRules.AddRange(
+            // Both key-bearing scopes, and the id in the casing an admin might have typed rather than
+            // the one Guid.ToString() produces.
+            NewRule(RateLimitScopeNames.ApiKey, keyId.ToString()),
+            NewRule(RateLimitScopeNames.ApiKeyModel, keyId.ToString().ToUpperInvariant() + "|gpt-4o"),
+            // Must survive: a different key, and a scope that never names a key.
+            NewRule(RateLimitScopeNames.ApiKey, otherKeyId.ToString()),
+            NewRule(RateLimitScopeNames.Model, "gpt-4o"));
+        await db.SaveChangesAsync();
+
+        (await sut.DeleteAsync(keyId)).Should().BeTrue();
+
+        db.RateLimitRules.Select(r => r.TargetKey).Should().BeEquivalentTo(
+            [otherKeyId.ToString(), "gpt-4o"],
+            "a rule whose subject no longer exists is unreachable clutter, but only its own subject's");
+    }
+
+    private static Autobahn.Persistence.Entities.RateLimitRuleEntity NewRule(string scope, string targetKey) =>
+        new()
+        {
+            Id = Guid.NewGuid(),
+            Scope = scope,
+            TargetKey = targetKey,
+            Rpm = 60,
+            Burst = 10,
+            MaxConcurrentStreams = 2,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+
+    [Fact]
+    public async Task MoveToTenantAsync_ReassignsTheKey_AndLeavesTheRestOfItAlone()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(nameof(MoveToTenantAsync_ReassignsTheKey_AndLeavesTheRestOfItAlone));
+        var (sut, sourceTenantId, keyId) = await SeedKeyAsync(db, "source");
+        var now = DateTimeOffset.UtcNow;
+        var targetTenantId = Guid.NewGuid();
+        await new TenantRepository(db).CreateAsync(
+            new TenantRecord(targetTenantId, "target", "Target", null, null, true, now, now));
+        var before = await sut.GetByIdAsync(keyId);
+
+        await sut.MoveToTenantAsync(keyId, targetTenantId);
+
+        var after = await sut.GetByIdAsync(keyId);
+        after.Should().BeEquivalentTo(before! with { TenantId = targetTenantId });
+        (await sut.ListByTenantAsync(sourceTenantId)).Should().BeEmpty();
+        (await sut.ListByTenantAsync(targetTenantId)).Should().ContainSingle(k => k.Id == keyId);
+    }
+
+    [Fact]
+    public async Task MoveToTenantAsync_UnknownId_Throws()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(nameof(MoveToTenantAsync_UnknownId_Throws));
+        var sut = new ApiKeyRepository(db);
+
+        var act = () => sut.MoveToTenantAsync(Guid.NewGuid(), Guid.NewGuid());
+
+        await act.Should().ThrowAsync<KeyNotFoundException>();
+    }
+
+    [Fact]
+    public async Task DeleteAsync_UnknownId_ReturnsFalse()
+    {
+        await using var db = PersistenceTestDbContextFactory.CreateInMemory(nameof(DeleteAsync_UnknownId_ReturnsFalse));
+        var (sut, _, _) = await SeedKeyAsync(db, nameof(DeleteAsync_UnknownId_ReturnsFalse));
+
+        (await sut.DeleteAsync(Guid.NewGuid())).Should().BeFalse();
+    }
+
+    private static async Task<(ApiKeyRepository Sut, Guid TenantId, Guid KeyId)> SeedKeyAsync(
+        Autobahn.Persistence.GatewayDbContext db,
+        string slug)
+    {
+        var sut = new ApiKeyRepository(db);
+        var now = DateTimeOffset.UtcNow;
+        var tenantId = Guid.NewGuid();
+        var keyId = Guid.NewGuid();
+
+        await new TenantRepository(db).CreateAsync(
+            new TenantRecord(tenantId, slug, slug, null, null, true, now, now));
+        await sut.CreateAsync(new ApiKeyRecord(
+            keyId,
+            tenantId,
+            "hash",
+            "sk-prefix",
+            ApiKeyRole.Inference,
+            [],
+            null,
+            null,
+            now,
+            null));
+
+        return (sut, tenantId, keyId);
+    }
+}

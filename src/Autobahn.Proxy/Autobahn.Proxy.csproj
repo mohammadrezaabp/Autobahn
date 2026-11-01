@@ -1,0 +1,12 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Yarp.ReverseProxy" />
+    <InternalsVisibleTo Include="Autobahn.Proxy.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Autobahn.Policy\Autobahn.Policy.csproj" />
+    <ProjectReference Include="..\Autobahn.Registry\Autobahn.Registry.csproj" />
+    <ProjectReference Include="..\Autobahn.Application\Autobahn.Application.csproj" />
+  </ItemGroup>
+</Project>

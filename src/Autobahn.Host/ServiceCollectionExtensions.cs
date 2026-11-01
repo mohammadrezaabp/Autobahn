@@ -1,0 +1,129 @@
+using Microsoft.Extensions.Options;
+using Autobahn.Host.DependencyInjection;
+using Autobahn.Host.DependencyInjection.Overview;
+using Autobahn.Registry.Health;
+using Autobahn.Host.Metrics;
+using Autobahn.Host.Panels;
+using Autobahn.Api.DependencyInjection;
+using Autobahn.Host.Hosting;
+using Autobahn.Application.Abstractions;
+using Autobahn.Domain.Configuration;
+using Autobahn.Application.Http;
+using Autobahn.Billing.DependencyInjection;
+using Autobahn.Policy.DependencyInjection;
+using Autobahn.Proxy.DependencyInjection;
+using Autobahn.Persistence.DependencyInjection;
+using Autobahn.Observability.DependencyInjection;
+using Autobahn.OperatorConsole.DependencyInjection;
+using Autobahn.Registry.DependencyInjection;
+using Autobahn.Security.DependencyInjection;
+
+namespace Autobahn.Host;
+
+public static class ServiceCollectionExtensions
+{
+    public static IServiceCollection AddGatewayCore(
+        this IServiceCollection services,
+        IConfiguration configuration,
+        IHostEnvironment environment)
+    {
+        services
+            .AddOptions<GatewayOptions>()
+            .Bind(configuration.GetSection(GatewayOptions.SectionName))
+            .ValidateOnStart();
+
+        services.AddSingleton<IPostConfigureOptions<GatewayOptions>, GatewayCorsEnvironmentPostConfigure>();
+        services.AddSingleton<IValidateOptions<GatewayOptions>, GatewayOptionsValidateOptions>();
+        // Cross-section: the reservation TTL is only meaningful relative to the resilience timeouts.
+        services.AddSingleton<IValidateOptions<BillingOptions>, BillingOptionsValidateOptions>();
+        services.AddOptions<BillingOptions>().ValidateOnStart();
+        services.AddGatewayCors(configuration, environment);
+        services.AddGatewayMetricsAccess(configuration);
+        services.AddGatewayPanels(configuration);
+        services.AddGatewayOpenTelemetry(configuration);
+        services.AddGatewayObservability();
+        services.AddGatewayPersistence(configuration);
+        // The environment is passed explicitly: without a database the gateway has no key store and
+        // runs open, and this is what lets AddGatewaySecurity refuse that outside Development.
+        services.AddGatewaySecurity(configuration, environment);
+        services.AddGatewayPolicy(configuration);
+        services.AddGatewayBilling(configuration);
+        services.AddGatewayBillingPersistence(configuration);
+        services.AddGatewayStatsPersistence(configuration);
+        services.AddGatewayErrorTracking(configuration);
+        services.AddGatewayConfigSnapshot(configuration);
+        // Lets the health sweep recognise a route pointing back at this gateway. It lives here
+        // because only the host knows what Kestrel bound, and the registry may not reference ASP.NET.
+        services.AddSingleton<IGatewaySelfAddressProvider, GatewayServerAddressProvider>();
+        services.AddGatewayRegistry();
+        services.AddGatewayApi();
+        services.AddGatewayProxy();
+        services.AddGatewayOverview();
+        services.AddHostedService<GatewayAdmissionLimitsStartupLogger>();
+        services.AddHttpClient(UpstreamHttpClientNames.Inference)
+            .ConfigureHttpClient(client =>
+            {
+                // Deadlines are owned per request by InferenceHttpForwarder, which splits them into a
+                // header phase and an idle-rearmed body phase and reports which one fired. A client
+                // timeout here is a second, hidden deadline over the whole exchange: it would cap the
+                // header allowance the forwarder widens for large-context requests, re-imposing the
+                // very ceiling that made a working backend look dead to the circuit breaker.
+                client.Timeout = Timeout.InfiniteTimeSpan;
+            })
+            // The connection pool is configured explicitly rather than left to the factory's
+            // defaults. The factory otherwise rotates the whole handler — and with it every pooled
+            // connection — every two minutes, so under steady load each rotation opens a fresh burst
+            // of TCP connections to the model server; and it lets idle connections die after 60 s,
+            // so bursty traffic pays a handshake per burst. Pinning the handler and letting
+            // SocketsHttpHandler age connections itself is the pattern Microsoft documents for
+            // long-lived clients. Nothing here caps concurrency: MaxConnectionsPerServer stays
+            // unlimited unless the operator opts in, so the per-model bulkhead remains the only
+            // admission control between clients and the GPU.
+            .SetHandlerLifetime(Timeout.InfiniteTimeSpan)
+            .ConfigurePrimaryHttpMessageHandler(sp =>
+            {
+                var resilience = sp.GetRequiredService<IOptions<GatewayOptions>>().Value.Resilience;
+                var handler = new SocketsHttpHandler
+                {
+                    AllowAutoRedirect = false,
+                    // Upstream bodies must arrive uncompressed for usage capture to read them; the
+                    // transformer already omits Accept-Encoding, this keeps the handler consistent.
+                    AutomaticDecompression = System.Net.DecompressionMethods.None,
+                    UseCookies = false,
+                    ConnectTimeout = TimeSpan.FromSeconds(resilience.UpstreamConnectTimeoutSeconds),
+                    PooledConnectionLifetime = resilience.UpstreamPooledConnectionLifetimeSeconds > 0
+                        ? TimeSpan.FromSeconds(resilience.UpstreamPooledConnectionLifetimeSeconds)
+                        : Timeout.InfiniteTimeSpan,
+                    PooledConnectionIdleTimeout =
+                        TimeSpan.FromSeconds(resilience.UpstreamPooledConnectionIdleTimeoutSeconds),
+                    MaxConnectionsPerServer = resilience.UpstreamMaxConnectionsPerServer > 0
+                        ? resilience.UpstreamMaxConnectionsPerServer
+                        : int.MaxValue,
+                    // A single HTTP/2 connection multiplexes ~100 streams; a backend that speaks
+                    // HTTP/2 would otherwise queue the 101st concurrent request behind the rest.
+                    EnableMultipleHttp2Connections = true,
+                };
+                return handler;
+            });
+
+        if (configuration.GetValue<bool>("Gateway:OperatorConsole:Enabled"))
+        {
+            services.AddOperatorConsole(configuration);
+        }
+
+        return services;
+    }
+
+    public static IServiceCollection AddGatewayHealthChecks(this IServiceCollection services)
+    {
+        // Registered explicitly so AddCheck resolves the singleton instead of constructing a fresh
+        // instance per probe. The check records an error record the first time a credential stops
+        // decrypting and not on every probe thereafter, and that "first time" lives in the
+        // instance — a per-probe instance turns one standing fault into one Critical record every
+        // few seconds, and health records carry no request id for the store's dedupe to catch.
+        services.AddSingleton<UpstreamSecretsHealthCheck>();
+        services.AddHealthChecks()
+            .AddCheck<UpstreamSecretsHealthCheck>("upstream-secrets");
+        return services;
+    }
+}

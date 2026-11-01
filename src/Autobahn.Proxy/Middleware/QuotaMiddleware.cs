@@ -1,0 +1,73 @@
+using Microsoft.AspNetCore.Http;
+using Autobahn.Application.Abstractions;
+using Autobahn.Application.Errors;
+using Autobahn.Domain.Identity;
+using Autobahn.Proxy.Errors;
+using Autobahn.Proxy.Routing;
+
+namespace Autobahn.Proxy.Middleware;
+
+public sealed class QuotaMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly IQuotaService _quotaService;
+    private readonly IErrorResponseWriter _errors;
+
+    public QuotaMiddleware(
+        RequestDelegate next,
+        IQuotaService quotaService,
+        IErrorResponseWriter errors)
+    {
+        _next = next;
+        _quotaService = quotaService;
+        _errors = errors;
+    }
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        if (!InferenceRouteClassifier.IsRoutableInference(context))
+        {
+            await _next(context).ConfigureAwait(false);
+            return;
+        }
+
+        var partitionKey = RateLimitPartition.Resolve(context);
+
+        // Model is not known here: routing reads it from the request body, which this middleware
+        // deliberately does not touch. Quota is counted per partition, not per model, so the
+        // parameter is passed empty rather than guessed from a query string the gateway never routes on.
+        const string modelHint = "";
+
+        // This is a check, not a reservation, and is therefore advisory: period usage is only
+        // known once the billing writer has flushed completed requests, so N concurrent requests
+        // near a token quota can all pass and the period can overshoot by roughly N in-flight
+        // requests. Hard-stop budgets are the enforced limit — the router reserves against those
+        // before forwarding (TryReserveAsync). Quotas are the soft, per-partition guard rail.
+        //
+        // Budget enforcement deliberately does NOT run here. ModelRouterMiddleware's
+        // TryReserveAsync subsumes it — it evaluates the same hard budgets against the same spend
+        // and additionally reserves the request's estimated cost — so running both meant two DI
+        // scopes, two budget queries and two period-spend scans per inference request, for one
+        // decision. It also runs after model resolution, so it can price the actual model rather
+        // than guessing from a query-string hint.
+        var check = _quotaService.CheckBeforeForward(partitionKey, modelHint);
+        if (!check.IsAllowed)
+        {
+            await context.WriteGatewayErrorAsync(
+                _errors.Write(GatewayErrorCode.QuotaExceeded),
+                context.RequestAborted).ConfigureAwait(false);
+            return;
+        }
+
+        if (check.IsSoftWarning && !string.IsNullOrEmpty(check.WarningMessage))
+        {
+            context.Response.OnStarting(() =>
+            {
+                context.Response.Headers[GatewayHeaders.QuotaWarning] = check.WarningMessage;
+                return Task.CompletedTask;
+            });
+        }
+
+        await _next(context).ConfigureAwait(false);
+    }
+}

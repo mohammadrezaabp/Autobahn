@@ -1,0 +1,6 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Autobahn.Proxy\Autobahn.Proxy.csproj" />
+    <ProjectReference Include="..\..\src\Autobahn.Registry\Autobahn.Registry.csproj" />
+  </ItemGroup>
+</Project>

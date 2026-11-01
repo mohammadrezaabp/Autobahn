@@ -1,0 +1,46 @@
+# Alerts on the synthetic probe (scripts/gateway-probe.py), which sends each model one real request
+# a minute: a chat request with a strict tool, an embeddings request or a rerank request. They
+# select the probe's own series, so with no probe scraped none of them can fire.
+groups:
+  - name: Autobahn-probe
+    rules:
+      # The gateway and the backend can both report healthy while this is 0: the model answers its
+      # health check and fails the request shape callers send. A 429 on the probe's own key is not
+      # a failure and leaves the series at 1.
+      - alert: GatewayProbeFailing
+        expr: gateway_probe_success == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'The {{ $labels.kind }} probe for {{ $labels.model }} is failing'
+          description: >-
+            The probe at {{ $labels.origin }} has had no correct answer from {{ $labels.model }} for
+            5 minutes. Last HTTP status:
+            {{ with query (printf "gateway_probe_http_status{model=%q,kind=%q,origin=%q}" $labels.model $labels.kind $labels.origin) }}{{ . | first | value }}{{ end }}
+            (0 means no answer).
+          runbook: docs/runbooks/high-error-rate.md#probe-failing
+      # The model listing is the first thing a round asks for. From a probe on another host this is
+      # the gateway being unreachable from outside, which nothing on the gateway's host can see.
+      - alert: GatewayProbeCannotReachGateway
+        expr: gateway_probe_models_listed == 0 and gateway_probe_last_round_timestamp_seconds > 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'The probe at {{ $labels.origin }} cannot reach the gateway'
+          description: >-
+            GET /v1/models has failed from {{ $labels.origin }} for 3 minutes: the gateway is down,
+            unreachable from there, or refusing the probe's key.
+          runbook: docs/runbooks/all-backends-down.md
+      # A probe that stopped looks like a probe that passes: its last results stay on the page.
+      - alert: GatewayProbeStale
+        expr: time() - gateway_probe_last_round_timestamp_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'The probe at {{ $labels.origin }} has stopped probing'
+          description: >-
+            The probe at {{ $labels.origin }} finished no round in the last 5 minutes, so its
+            results are old. Check the probe container or process.

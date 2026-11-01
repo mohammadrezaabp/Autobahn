@@ -1,0 +1,188 @@
+# promtool test rules deploy/prometheus/alerts/tests/Autobahn-providers_test.yml
+rule_files:
+  - ../Autobahn-providers.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: credit under the level an operator set alerts, and a provider with no level does not
+    interval: 1m
+    input_series:
+      - series: 'gateway_provider_credit_remaining{provider="openrouter",currency="USD"}'
+        values: '40x5 12.5x30'
+      - series: 'gateway_provider_credit_low_threshold{provider="openrouter"}'
+        values: '20x35'
+      # DeepSeek is low too, and nobody asked to be warned about it.
+      - series: 'gateway_provider_credit_remaining{provider="deepseek",currency="USD"}'
+        values: '1x35'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: GatewayProviderCreditLow
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: GatewayProviderCreditLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              provider: openrouter
+              currency: USD
+            exp_annotations:
+              summary: 'openrouter credit is low: 12.50 USD left'
+              description: >-
+                The remaining openrouter credit has been below the alert level for 10 minutes. When
+                it reaches zero every caller of a openrouter model is refused at once. Top up the
+                account, or lower the tenants' monthly caps.
+              runbook: docs/runbooks/providers.md#credit-low
+
+  - name: the first 402 alerts although the counter was only just created
+    interval: 1m
+    input_series:
+      # No series for the first ten minutes, then it appears already at 1.
+      - series: 'gateway_provider_account_refusals_total{provider="openrouter",upstream_status="402"}'
+        values: '_x10 1x30'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: GatewayProviderCreditExhausted
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: GatewayProviderCreditExhausted
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              provider: openrouter
+            exp_annotations:
+              summary: 'openrouter is refusing requests: the account is out of credit'
+              description: >-
+                openrouter answered 402 (payment required) in the last 10 minutes. Requests to its
+                models fail for every key until the account is topped up.
+              runbook: docs/runbooks/providers.md#credit-exhausted
+      # Ten quiet minutes later it has resolved.
+      - eval_time: 35m
+        alertname: GatewayProviderCreditExhausted
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: GatewayProviderKeyRejected
+        exp_alerts: []
+
+  - name: a 401 is the key, not the credit
+    interval: 1m
+    input_series:
+      - series: 'gateway_provider_account_refusals_total{provider="openai",upstream_status="401"}'
+        values: '0x10 0+3x10 30x10'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayProviderKeyRejected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              provider: openai
+            exp_annotations:
+              summary: openai is rejecting the company key
+              description: >-
+                openai answered 401 in the last 10 minutes: the key the gateway holds is revoked,
+                expired or wrong. Replace it on Providers › Settings.
+              runbook: docs/runbooks/providers.md#key-rejected
+      - eval_time: 15m
+        alertname: GatewayProviderCreditExhausted
+        exp_alerts: []
+
+  - name: a day at over three times the weekly average is a spike, a steady provider is not
+    interval: 1h
+    input_series:
+      # About 2.4 USD a day for eight days, then 2 USD an hour.
+      - series: 'gateway_provider_spend_dollars_total{provider="openrouter"}'
+        values: '0+0.1x192 21.2+2x30'
+      # A steady 12 USD a day.
+      - series: 'gateway_provider_spend_dollars_total{provider="deepseek"}'
+        values: '0+0.5x223'
+    alert_rule_test:
+      - eval_time: 190h
+        alertname: GatewayProviderSpendSpike
+        exp_alerts: []
+      - eval_time: 216h
+        alertname: GatewayProviderSpendSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              provider: openrouter
+            exp_annotations:
+              summary: 'openrouter spend is 48.00 USD in 24 hours, over three times the recent daily average'
+              description: >-
+                Spend at openrouter in the last 24 hours is more than three times the daily average
+                of the seven days before. Providers › Spend shows which tenant, key and model it
+                came from.
+              runbook: docs/runbooks/providers.md#spend-spike
+
+  - name: a tenant at 80 percent of its cap alerts for that tenant only
+    interval: 1m
+    input_series:
+      - series: 'gateway_provider_tenant_cap_used_ratio{provider="openrouter",tenant="easy"}'
+        values: '0.5x5 0.85x20'
+      - series: 'gateway_provider_tenant_cap_used_ratio{provider="openrouter",tenant="fanus"}'
+        values: '0.1x25'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GatewayProviderTenantNearCap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              provider: openrouter
+              tenant: easy
+              team: easy
+            exp_annotations:
+              summary: easy has used 85% of its openrouter cap
+              description: >-
+                Tenant easy has spent at least 80% of its monthly openrouter cap. At 100% its keys
+                are refused with spend_cap_reached until the month ends or an operator raises the
+                cap.
+              runbook: docs/runbooks/providers.md#tenant-near-cap
+
+  - name: drift alerts after an hour of the flag, and a provider within the threshold does not
+    interval: 1m
+    input_series:
+      - series: 'gateway_provider_spend_drifting{provider="deepseek"}'
+        values: '0x10 1x80'
+      - series: 'gateway_provider_spend_drifting{provider="openrouter"}'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: GatewayProviderSpendDrift
+        exp_alerts: []
+      - eval_time: 75m
+        alertname: GatewayProviderSpendDrift
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              provider: deepseek
+            exp_annotations:
+              summary: deepseek spend and the gateway's charges disagree this month
+              description: >-
+                The deepseek balance fell by more than the gateway charged for its requests there,
+                or by less, past the drift threshold, for an hour. A model's rate card may be
+                wrong, or another client is spending on the same account. Providers › deepseek ›
+                Spend shows the comparison by day.
+              runbook: docs/runbooks/providers.md#spend-drift
+
+  - name: a balance that stops being read alerts after half an hour
+    interval: 1m
+    input_series:
+      # Read every minute for ten minutes, then never again.
+      - series: 'gateway_provider_credit_last_read_timestamp_seconds{provider="openrouter"}'
+        values: '0+60x10 600x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: GatewayProviderBalanceUnknown
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: GatewayProviderBalanceUnknown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              provider: openrouter
+            exp_annotations:
+              summary: The openrouter balance has not been read for 30 minutes
+              description: >-
+                The gateway could not read the openrouter credit for 30 minutes, so the low-credit
+                alert is blind. The provider is unreachable from the gateway, or is refusing the
+                key. Providers › openrouter shows the last error.
+              runbook: docs/runbooks/providers.md#balance-unknown

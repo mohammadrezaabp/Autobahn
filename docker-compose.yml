@@ -1,0 +1,45 @@
+name: autobahn
+services:
+  gateway:
+    build:
+      context: .
+      target: gateway
+    restart: unless-stopped
+    ports: ["127.0.0.1:8080:8080"]
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      Gateway__Bootstrap__AdminApiKey: ${AUTOBAHN_ADMIN_KEY:?Run scripts/Initialize.ps1 first}
+      Gateway__Bootstrap__KeyPepper: ${AUTOBAHN_KEY_PEPPER:?Run scripts/Initialize.ps1 first}
+      Gateway__Security__KeyPepper: ${AUTOBAHN_KEY_PEPPER:?Run scripts/Initialize.ps1 first}
+      Gateway__Metrics__ScrapeToken: ${AUTOBAHN_METRICS_TOKEN:?Run scripts/Initialize.ps1 first}
+    volumes:
+      - gateway-data:/app/data
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    profiles: [observability]
+    restart: unless-stopped
+    ports: ["127.0.0.1:9090:9090"]
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts:/etc/prometheus/alerts:ro
+      - prometheus-data:/prometheus
+    secrets: [metrics_token]
+  grafana:
+    image: grafana/grafana:11.6.0
+    profiles: [observability]
+    restart: unless-stopped
+    ports: ["127.0.0.1:3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${AUTOBAHN_GRAFANA_PASSWORD:?Run scripts/Initialize.ps1 first}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+volumes:
+  gateway-data:
+  prometheus-data:
+  grafana-data:
+secrets:
+  metrics_token:
+    file: .secrets/metrics-token

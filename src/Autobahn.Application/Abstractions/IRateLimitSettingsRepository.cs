@@ -1,0 +1,41 @@
+using Autobahn.Domain.RateLimiting;
+
+namespace Autobahn.Application.Abstractions;
+
+/// <summary>
+/// Persists the database-backed rate-limit configuration: the default tier, the per-plan tiers, and
+/// the scoped rules. Registered only when a database connection string is configured.
+/// </summary>
+public interface IRateLimitSettingsRepository
+{
+    /// <summary>
+    /// Replaces the whole rate-limit configuration and bumps the config version, in a single atomic
+    /// write. Plan slugs and rule targets are stored as given; the snapshot compares them
+    /// OrdinalIgnoreCase.
+    /// </summary>
+    /// <param name="enabled">
+    /// Global master switch. Tier values are still persisted when false, so disabling and re-enabling
+    /// round-trips without losing the configured numbers.
+    /// </param>
+    /// <param name="adaptiveEnabled">Whether load-aware adaptation may reduce the configured tiers.</param>
+    /// <param name="rules">
+    /// The complete set of scoped rules. Replaced wholesale rather than merged: a partial update
+    /// gives no way to remove a rule, and two admins editing different scopes would each resurrect
+    /// what the other deleted.
+    /// </param>
+    /// <param name="expectedVersion">
+    /// The configuration version the caller based its change on. When supplied and no longer current
+    /// the write is abandoned and <see cref="Autobahn.Domain.Configuration.RateLimitVersionConflictException"/>
+    /// is thrown rather than erasing whatever landed in between — which, with a rule set replaced
+    /// wholesale, is what a stale write does. Pass null only for unconditional replacement.
+    /// </param>
+    /// <returns>The new configuration version.</returns>
+    Task<long> SaveAsync(
+        bool enabled,
+        bool adaptiveEnabled,
+        RateLimitPolicy defaultTier,
+        IReadOnlyDictionary<string, RateLimitPolicy> plans,
+        IReadOnlyList<RateLimitRuleDefinition> rules,
+        long? expectedVersion = null,
+        CancellationToken cancellationToken = default);
+}

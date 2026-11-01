@@ -1,0 +1,381 @@
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text;
+using System.Text.Json;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Autobahn.Integration.Tests.Support;
+
+namespace Autobahn.Integration.Tests.Admin;
+
+public sealed class AdminRateLimitEndpointTests
+{
+    private const string AdminKey = "sk-Autobahn-integration-admin-key";
+
+    [Fact]
+    public async Task GetRateLimits_WithoutAuth_Returns401()
+    {
+        await using var factory = GatewayWebApplicationFactory.CreateWithInMemoryDatabase(AdminKey);
+        await GatewayWebApplicationFactory.EnsureAuthReadyAsync(factory);
+        var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/admin/api/rate-limits");
+
+        response.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+    }
+
+    [Fact]
+    public async Task GetRateLimits_WithAdmin_ReturnsDefaultAndPlans()
+    {
+        await using var factory = GatewayWebApplicationFactory.CreateWithInMemoryDatabase(
+            AdminKey,
+            configureSettings: settings =>
+            {
+                settings["RateLimiting:Default:Rpm"] = "77";
+                settings["RateLimiting:Plans:standard:Rpm"] = "150";
+            });
+        await GatewayWebApplicationFactory.EnsureAuthReadyAsync(factory);
+        var client = CreateAuthenticatedClient(factory, AdminKey);
+
+        var response = await client.GetAsync("/admin/api/rate-limits");
+        response.EnsureSuccessStatusCode();
+
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        json.RootElement.GetProperty("default").GetProperty("rpm").GetInt32().Should().Be(77);
+        json.RootElement.GetProperty("plans").GetProperty("standard").GetProperty("rpm").GetInt32().Should().Be(150);
+    }
+
+    [Fact]
+    public async Task PutRateLimits_InvalidRpm_Returns400WithMessage()
+    {
+        await using var factory = CreateFactoryWithWritableAppSettings();
+        await GatewayWebApplicationFactory.EnsureAuthReadyAsync(factory);
+        var client = CreateAuthenticatedClient(factory, AdminKey);
+
+        var response = await client.PutAsJsonAsync(
+            "/admin/api/rate-limits",
+            new
+            {
+                @default = new { rpm = 0, burst = 0, maxConcurrentStreams = 0 },
+                plans = new Dictionary<string, object>(),
+            });
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        json.RootElement.GetProperty("message").GetString().Should().Contain("rpm");
+    }
+
+    [Fact]
+    public async Task PutRateLimits_ValidPayload_UpdatesGetResponse()
+    {
+        await using var factory = CreateFactoryWithWritableAppSettings();
+        await GatewayWebApplicationFactory.EnsureAuthReadyAsync(factory);
+        var client = CreateAuthenticatedClient(factory, AdminKey);
+
+        var putResponse = await client.PutAsJsonAsync(
+            "/admin/api/rate-limits",
+            new
+            {
+                @default = new { rpm = 55, burst = 5, maxConcurrentStreams = 5 },
+                plans = new Dictionary<string, object>
+                {
+                    ["pro"] = new { rpm = 200, burst = 20, maxConcurrentStreams = 15 },
+                },
+            });
+        putResponse.EnsureSuccessStatusCode();
+
+        var getResponse = await client.GetAsync("/admin/api/rate-limits");
+        getResponse.EnsureSuccessStatusCode();
+        using var json = JsonDocument.Parse(await getResponse.Content.ReadAsStringAsync());
+        json.RootElement.GetProperty("default").GetProperty("rpm").GetInt32().Should().Be(55);
+        json.RootElement.GetProperty("plans").GetProperty("pro").GetProperty("rpm").GetInt32().Should().Be(200);
+    }
+
+    private static HttpRequestMessage PutWithIfMatch(string etag, int rpm)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Put, "/admin/api/rate-limits")
+        {
+            Content = JsonContent.Create(new
+            {
+                @default = new { rpm, burst = 0, maxConcurrentStreams = 0 },
+                plans = new Dictionary<string, object>(),
+            }),
+        };
+        request.Headers.TryAddWithoutValidation("If-Match", etag);
+        return request;
+    }
+
+    /// <summary>
+    /// The write answers with the version it produced, as an ETag and in the body, so a client can
+    /// base its next write on it without a second request — and that version is the rate-limit
+    /// configuration's own, so saving CORS in between is not a conflict while a genuinely stale write
+    /// still is.
+    /// </summary>
+    [Fact]
+    public async Task PutRateLimits_ReturnsItsVersion_WhichSurvivesACorsSaveAndRefusesAStaleWrite()
+    {
+        await using var factory = CreateFactoryWithWritableAppSettings();
+        await GatewayWebApplicationFactory.EnsureAuthReadyAsync(factory);
+        var client = CreateAuthenticatedClient(factory, AdminKey);
+
+        var read = await client.GetAsync("/admin/api/rate-limits");
+        read.EnsureSuccessStatusCode();
+        var readTag = read.Headers.ETag!.ToString();
+
+        var first = await client.SendAsync(PutWithIfMatch(readTag, 55));
+        first.EnsureSuccessStatusCode();
+        var firstTag = first.Headers.ETag!.ToString();
+        firstTag.Should().NotBe(readTag);
+        using (var body = JsonDocument.Parse(await first.Content.ReadAsStringAsync()))
+        {
+            firstTag.Should().Be($"W/\"{body.RootElement.GetProperty("version").GetInt64()}\"");
+        }
+
+        (await client.GetAsync("/admin/api/rate-limits")).Headers.ETag!.ToString().Should().Be(firstTag);
+
+        (await client.PutAsJsonAsync("/admin/api/cors", new { allowedOrigins = new[] { "https://console.example" } }))
+            .EnsureSuccessStatusCode();
+
+        var afterCors = await client.SendAsync(PutWithIfMatch(firstTag, 66));
+        afterCors.StatusCode.Should().Be(HttpStatusCode.OK, "a CORS save is not a rate-limit change");
+
+        var stale = await client.SendAsync(PutWithIfMatch(firstTag, 77));
+        stale.StatusCode.Should().Be(HttpStatusCode.Conflict);
+
+        using var current = JsonDocument.Parse(await (await client.GetAsync("/admin/api/rate-limits")).Content.ReadAsStringAsync());
+        current.RootElement.GetProperty("default").GetProperty("rpm").GetInt32().Should().Be(66);
+    }
+
+    /// <summary>A days list past a week's worth is answered 400 from its length, before any span is compared.</summary>
+    [Fact]
+    public async Task PutRateLimits_WeeklyWindowWithRepeatedDays_Returns400Promptly()
+    {
+        await using var factory = CreateFactoryWithWritableAppSettings();
+        await GatewayWebApplicationFactory.EnsureAuthReadyAsync(factory);
+        var client = CreateAuthenticatedClient(factory, AdminKey);
+
+        object Window(string name, string day) => new
+        {
+            name, kind = "weekly", rpm = 10, burst = 0, maxConcurrentStreams = 0,
+            days = Enumerable.Repeat(day, 20_000).ToArray(), start = "01:00", end = "02:00", timeZone = "UTC",
+        };
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var response = await client.PutAsJsonAsync(
+            "/admin/api/rate-limits",
+            new
+            {
+                @default = new { rpm = 55, burst = 0, maxConcurrentStreams = 0 },
+                plans = new Dictionary<string, object>(),
+                rules = new[]
+                {
+                    new
+                    {
+                        scope = "model", target = "gpt-4", rpm = 60, burst = 0, maxConcurrentStreams = 0,
+                        schedule = new[] { Window("a", "mon"), Window("b", "wed") },
+                    },
+                },
+            });
+        watch.Stop();
+
+        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        (await response.Content.ReadAsStringAsync()).Should().Contain("at most 7 days");
+        watch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(10));
+    }
+
+    [Fact]
+    public async Task PutRateLimits_ReducesDefaultRpm_EnforcedOnInference()
+    {
+        var handler = new MockUpstreamHandler();
+        await using var factory = CreateFactoryWithWritableAppSettings(handler);
+        await GatewayWebApplicationFactory.EnsureAuthReadyAsync(factory);
+        var admin = CreateAuthenticatedClient(factory, AdminKey);
+
+        var putResponse = await admin.PutAsJsonAsync(
+            "/admin/api/rate-limits",
+            new
+            {
+                @default = new { rpm = 1, burst = 0, maxConcurrentStreams = 5 },
+                plans = new Dictionary<string, object>(),
+            });
+        putResponse.EnsureSuccessStatusCode();
+
+        var createKey = await admin.PostAsJsonAsync("/admin/api/keys", new { role = "Inference" });
+        createKey.EnsureSuccessStatusCode();
+        using var created = JsonDocument.Parse(await createKey.Content.ReadAsStringAsync());
+        var keyId = created.RootElement.GetProperty("id").GetGuid();
+        var secret = created.RootElement.GetProperty("secret").GetString()!;
+
+        var grantResponse = await admin.PutAsJsonAsync(
+            $"/admin/api/keys/{keyId}/model-grants",
+            new { modelIds = new[] { "local-mock" } });
+        grantResponse.EnsureSuccessStatusCode();
+
+        var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", secret);
+        var body = JsonSerializer.Serialize(new
+        {
+            model = "local-mock",
+            messages = new[] { new { role = "user", content = "hi" } },
+        });
+        using var content = new StringContent(body, Encoding.UTF8, "application/json");
+
+        var first = await client.PostAsync("/v1/chat/completions", content);
+        first.StatusCode.Should().BeOneOf(HttpStatusCode.OK, HttpStatusCode.BadGateway);
+
+        using var content2 = new StringContent(body, Encoding.UTF8, "application/json");
+        var second = await client.PostAsync("/v1/chat/completions", content2);
+        second.StatusCode.Should().Be(HttpStatusCode.TooManyRequests);
+    }
+
+    [Fact]
+    public async Task PutRateLimits_WhenDisabled_NotEnforcedOnInference()
+    {
+        var handler = new MockUpstreamHandler();
+        await using var factory = CreateFactoryWithWritableAppSettings(handler);
+        await GatewayWebApplicationFactory.EnsureAuthReadyAsync(factory);
+        var admin = CreateAuthenticatedClient(factory, AdminKey);
+
+        // Same rpm=1 tier that returns 429 on the second request above, but with the switch off.
+        var putResponse = await admin.PutAsJsonAsync(
+            "/admin/api/rate-limits",
+            new
+            {
+                enabled = false,
+                @default = new { rpm = 1, burst = 0, maxConcurrentStreams = 5 },
+                plans = new Dictionary<string, object>(),
+            });
+        putResponse.EnsureSuccessStatusCode();
+
+        var client = await CreateInferenceClientAsync(factory, admin);
+        var body = JsonSerializer.Serialize(new
+        {
+            model = "local-mock",
+            messages = new[] { new { role = "user", content = "hi" } },
+        });
+
+        for (var i = 0; i < 4; i++)
+        {
+            using var content = new StringContent(body, Encoding.UTF8, "application/json");
+            var response = await client.PostAsync("/v1/chat/completions", content);
+            response.StatusCode.Should().NotBe(HttpStatusCode.TooManyRequests);
+        }
+    }
+
+    [Fact]
+    public async Task PutRateLimits_WithoutEnabledField_RemainsEnabled()
+    {
+        await using var factory = CreateFactoryWithWritableAppSettings();
+        await GatewayWebApplicationFactory.EnsureAuthReadyAsync(factory);
+        var admin = CreateAuthenticatedClient(factory, AdminKey);
+
+        // Older API clients omit the field entirely; that must not silently disable enforcement.
+        var putResponse = await admin.PutAsJsonAsync(
+            "/admin/api/rate-limits",
+            new
+            {
+                @default = new { rpm = 55, burst = 5, maxConcurrentStreams = 4 },
+                plans = new Dictionary<string, object>(),
+            });
+        putResponse.EnsureSuccessStatusCode();
+
+        var getResponse = await admin.GetAsync("/admin/api/rate-limits");
+        getResponse.EnsureSuccessStatusCode();
+        using var json = JsonDocument.Parse(await getResponse.Content.ReadAsStringAsync());
+        json.RootElement.GetProperty("enabled").GetBoolean().Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task PutRateLimits_DisabledThenReEnabled_RestoresConfiguredTiers()
+    {
+        await using var factory = CreateFactoryWithWritableAppSettings();
+        await GatewayWebApplicationFactory.EnsureAuthReadyAsync(factory);
+        var admin = CreateAuthenticatedClient(factory, AdminKey);
+
+        (await admin.PutAsJsonAsync(
+            "/admin/api/rate-limits",
+            new
+            {
+                enabled = false,
+                @default = new { rpm = 77, burst = 7, maxConcurrentStreams = 3 },
+                plans = new Dictionary<string, object>(),
+            })).EnsureSuccessStatusCode();
+
+        var disabled = await admin.GetAsync("/admin/api/rate-limits");
+        using (var json = JsonDocument.Parse(await disabled.Content.ReadAsStringAsync()))
+        {
+            json.RootElement.GetProperty("enabled").GetBoolean().Should().BeFalse();
+            // Values are retained while disabled, so re-enabling does not reset them.
+            json.RootElement.GetProperty("default").GetProperty("rpm").GetInt32().Should().Be(77);
+        }
+
+        (await admin.PutAsJsonAsync(
+            "/admin/api/rate-limits",
+            new
+            {
+                enabled = true,
+                @default = new { rpm = 77, burst = 7, maxConcurrentStreams = 3 },
+                plans = new Dictionary<string, object>(),
+            })).EnsureSuccessStatusCode();
+
+        var reenabled = await admin.GetAsync("/admin/api/rate-limits");
+        using var final = JsonDocument.Parse(await reenabled.Content.ReadAsStringAsync());
+        final.RootElement.GetProperty("enabled").GetBoolean().Should().BeTrue();
+        final.RootElement.GetProperty("default").GetProperty("rpm").GetInt32().Should().Be(77);
+    }
+
+    private static async Task<HttpClient> CreateInferenceClientAsync(
+        WebApplicationFactory<Program> factory,
+        HttpClient admin)
+    {
+        var createKey = await admin.PostAsJsonAsync("/admin/api/keys", new { role = "Inference" });
+        createKey.EnsureSuccessStatusCode();
+        using var created = JsonDocument.Parse(await createKey.Content.ReadAsStringAsync());
+        var keyId = created.RootElement.GetProperty("id").GetGuid();
+        var secret = created.RootElement.GetProperty("secret").GetString()!;
+
+        var grantResponse = await admin.PutAsJsonAsync(
+            $"/admin/api/keys/{keyId}/model-grants",
+            new { modelIds = new[] { "local-mock" } });
+        grantResponse.EnsureSuccessStatusCode();
+
+        var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", secret);
+        return client;
+    }
+
+    private static WebApplicationFactory<Program> CreateFactoryWithWritableAppSettings(
+        HttpMessageHandler? upstreamHandler = null)
+    {
+        var contentRoot = Path.Combine(Path.GetTempPath(), "Autobahn-rate-limit-api-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(contentRoot);
+        File.WriteAllText(
+            Path.Combine(contentRoot, "appsettings.json"),
+            """
+            {
+              "RateLimiting": {
+                "Default": { "Rpm": 10, "Burst": 1, "MaxConcurrentStreams": 1 },
+                "Plans": {}
+              },
+              "Gateway": {
+                "Bootstrap": { "Enabled": false },
+                "ModelsConfigPath": "config/models.json"
+              }
+            }
+            """);
+
+        return GatewayWebApplicationFactory.CreateWithInMemoryDatabase(
+            AdminKey,
+            upstreamHandler: upstreamHandler,
+            configureSettings: settings => settings["Gateway:AppSettingsPath"] = "appsettings.json")
+            .WithWebHostBuilder(builder => builder.UseContentRoot(contentRoot));
+    }
+
+    private static HttpClient CreateAuthenticatedClient(WebApplicationFactory<Program> factory, string apiKey)
+    {
+        var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        return client;
+    }
+}

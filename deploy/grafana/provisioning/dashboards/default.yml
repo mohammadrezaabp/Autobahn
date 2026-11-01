@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: Autobahn
+    orgId: 1
+    folder: Autobahn
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

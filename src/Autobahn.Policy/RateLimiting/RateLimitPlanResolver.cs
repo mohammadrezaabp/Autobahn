@@ -1,0 +1,340 @@
+using System.Collections.Concurrent;
+using Autobahn.Application.Abstractions;
+using Autobahn.Domain.Configuration;
+using Autobahn.Domain.RateLimiting;
+
+namespace Autobahn.Policy.RateLimiting;
+
+/// <summary>
+/// Builds the rule set for a request — one rule per scope that applies to it — and caches the result
+/// so the hot path is a dictionary lookup rather than a rebuild.
+/// </summary>
+/// <remarks>
+/// <para>Resolving from scratch means six map lookups, two string concatenations for the combined
+/// scopes, and an array. Doing that on every inference request would put more work in front of the
+/// limiter than the limiter itself costs, so a resolved plan is cached per distinct
+/// (tenant, key, plan, model) combination and reused until the configuration changes.</para>
+///
+/// <para>The cache key carries the config snapshot's version, so an admin edit invalidates every
+/// entry the moment it lands — there is no TTL to wait out and no staleness window in which the
+/// gateway enforces a limit an operator has already changed. It also carries the adaptive factor,
+/// <em>quantised</em> to a small number of steps: baking the raw factor in would mint a fresh entry
+/// every time the governor nudged a model by a thousandth, while quantising bounds the churn to a
+/// fixed number of variants per model and costs at most one step of precision on a number that is
+/// already an approximation.</para>
+/// </remarks>
+/// <param name="authState">
+/// Whether the gateway requires credentials. A subject with no tenant is held to the anonymous tier
+/// only when it could have authenticated and did not; with authentication off, every caller has no
+/// tenant and keeps the default tier. The flag is part of the cache key because it is set at
+/// startup, after the first requests may already have been resolved.
+/// </param>
+public sealed class RateLimitPlanResolver(
+    IGatewayConfigProvider configProvider,
+    IAdaptiveRateLimitGovernor? governor = null,
+    IGatewayAuthenticationState? authState = null) : IRateLimitPlanResolver
+{
+    /// <summary>
+    /// Adaptive factors are rounded to this many steps for cache-key purposes: 20 steps is a 5%
+    /// granularity, finer than the governor's own recovery increment.
+    /// </summary>
+    private const int FactorQuantisationSteps = 20;
+
+    /// <summary>
+    /// Cache ceiling. Entries are keyed by identity and model, so the natural size is
+    /// (keys × models); the ceiling only matters when anonymous traffic pushes the identity count up.
+    /// Past it the cache is dropped wholesale rather than evicted one at a time — rebuilding a plan
+    /// is cheap, and an LRU here would cost more to maintain than it saves.
+    /// </summary>
+    private const int MaxCacheEntries = 20_000;
+
+    private readonly ConcurrentDictionary<PlanCacheKey, RateLimitPlan> _cache = new();
+
+    // Tracked alongside the dictionary rather than read from it. ConcurrentDictionary.Count takes
+    // every bucket lock to produce an exact count, and the ceiling is checked on every cache miss —
+    // so with a cache key that carries the caller's partition, traffic from many distinct client
+    // addresses made each request take all of them. The same reason the store and the governor keep
+    // their own counters.
+    private int _cacheCount;
+
+    private TokenRulesFlag? _tokenRules;
+
+    private sealed record TokenRulesFlag(RateLimitsConfigSection Section, bool Value);
+
+    public bool IsEnabled() => configProvider.Current.RateLimits.Enabled;
+
+    public bool HasModelScopedRules()
+    {
+        var rateLimits = configProvider.Current.RateLimits;
+        return rateLimits.Models.Count > 0 ||
+               rateLimits.TenantModels.Count > 0 ||
+               rateLimits.ApiKeyModels.Count > 0;
+    }
+
+    public bool HasTokenRules()
+    {
+        // Kept for as long as the snapshot hands back the same section: the answer needs a walk
+        // over every tier, and this is asked on every inference request.
+        var rateLimits = configProvider.Current.RateLimits;
+        var cached = Volatile.Read(ref _tokenRules);
+        if (cached is null || !ReferenceEquals(cached.Section, rateLimits))
+        {
+            cached = new TokenRulesFlag(rateLimits, rateLimits.HasTokenLimits());
+            Volatile.Write(ref _tokenRules, cached);
+        }
+
+        return cached.Value;
+    }
+
+    public RateLimitPlan Resolve(in RateLimitSubject subject, string? modelId)
+    {
+        var snapshot = configProvider.Current;
+        var rateLimits = snapshot.RateLimits;
+
+        var factorStep = ModelFactorStep(rateLimits, modelId);
+        var anonymous = subject.TenantId is null && (authState?.IsAuthenticationRequired ?? false);
+        var key = new PlanCacheKey(
+            snapshot.Version,
+            rateLimits.EffectiveVersion,
+            subject.PartitionKey,
+            subject.TenantId,
+            subject.TenantSlug,
+            subject.PlanSlug,
+            subject.ApiKeyId,
+            modelId,
+            factorStep,
+            anonymous);
+
+        if (_cache.TryGetValue(key, out var cached))
+        {
+            return cached;
+        }
+
+        var plan = Build(rateLimits, subject, modelId, factorStep, anonymous);
+
+        if (Volatile.Read(ref _cacheCount) >= MaxCacheEntries)
+        {
+            _cache.Clear();
+            Interlocked.Exchange(ref _cacheCount, 0);
+        }
+
+        if (_cache.TryAdd(key, plan))
+        {
+            Interlocked.Increment(ref _cacheCount);
+        }
+
+        return plan;
+    }
+
+    private int ModelFactorStep(RateLimitsConfigSection rateLimits, string? modelId)
+    {
+        if (modelId is null || governor is null || !rateLimits.AdaptiveEnabled || !governor.IsEnabled)
+        {
+            return FactorQuantisationSteps;
+        }
+
+        var factor = Math.Clamp(governor.GetModelFactor(modelId), 0.0, 1.0);
+        return (int)Math.Round(factor * FactorQuantisationSteps);
+    }
+
+    private static RateLimitPlan Build(
+        RateLimitsConfigSection rateLimits,
+        in RateLimitSubject subject,
+        string? modelId,
+        int factorStep,
+        bool anonymous)
+    {
+        var rules = new List<RateLimitRule>(RateLimitRuleBuffer.MaxRules);
+
+        // --- Stage one: everything that can be decided before the body is parsed. ---
+
+        if (!rateLimits.Global.EnforcesNothing)
+        {
+            rules.Add(new RateLimitRule(RateLimitScope.Global, RateLimitKeys.GlobalPartition, rateLimits.Global)
+            {
+                LimitId = RateLimitLimitIds.Global,
+                StreamLimitId = RateLimitLimitIds.Global,
+            });
+        }
+
+        // The tenant scope always produces a rule: it is the gateway's universal limit, and the
+        // default tier stands in when nothing more specific is configured. A caller that could have
+        // presented a key and did not — anonymous traffic to a public model — gets the anonymous
+        // tier rather than the one sized for a paying tenant.
+        var tenantTier = anonymous
+            ? RateLimitPolicyResolver.ResolveAnonymousTier(rateLimits, authenticationRequired: true)
+            : RateLimitPolicyResolver.ResolveTenantTier(
+                rateLimits,
+                subject.PlanSlug,
+                subject.TenantId,
+                subject.TenantSlug);
+        // Which control the tier came from, so the per-limit report counts this bucket under the
+        // number an operator would have to edit. Resolved here, once per cached plan.
+        var (tenantRateId, tenantStreamId) = anonymous
+            ? RateLimitPolicyResolver.ResolveAnonymousTierSource(rateLimits, authenticationRequired: true)
+            : RateLimitPolicyResolver.ResolveTenantTierSource(
+                rateLimits,
+                subject.PlanSlug,
+                subject.TenantId,
+                subject.TenantSlug);
+        rules.Add(new RateLimitRule(
+            RateLimitScope.Tenant,
+            RateLimitKeys.Tenant(subject.PartitionKey),
+            tenantTier)
+        {
+            LimitId = tenantRateId,
+            StreamLimitId = tenantStreamId,
+        });
+
+        if (!string.IsNullOrEmpty(subject.ApiKeyId) &&
+            rateLimits.ApiKeys.TryGetValue(subject.ApiKeyId, out var keyTier) &&
+            !keyTier.EnforcesNothing)
+        {
+            var keyLimitId = RateLimitLimitIds.Rule(RateLimitScopeNames.ApiKey, subject.ApiKeyId);
+            rules.Add(new RateLimitRule(RateLimitScope.ApiKey, RateLimitKeys.ApiKey(subject.ApiKeyId), keyTier)
+            {
+                LimitId = keyLimitId,
+                StreamLimitId = keyLimitId,
+            });
+        }
+
+        var modelStageIndex = rules.Count;
+
+        // --- Stage two: everything that needs the model. ---
+
+        if (!string.IsNullOrEmpty(modelId))
+        {
+            var factor = (double)factorStep / FactorQuantisationSteps;
+
+            if (rateLimits.Models.TryGetValue(modelId, out var modelTier) && !modelTier.EnforcesNothing)
+            {
+                // Anonymous callers are counted in their own bucket under the same rule. The model
+                // bucket is shared by everyone who uses the model, so with a publicAccess model the
+                // internet at large was spending the budget authenticated tenants depend on.
+                var modelPartition = anonymous
+                    ? RateLimitKeys.AnonymousModel(modelId)
+                    : RateLimitKeys.Model(modelId);
+                rules.Add(Adapt(
+                    RateLimitScope.Model,
+                    modelPartition,
+                    modelTier,
+                    factor,
+                    RateLimitLimitIds.Rule(RateLimitScopeNames.Model, modelId)) with
+                {
+                    AnonymousBucket = anonymous,
+                });
+            }
+
+            // Matched on the tenant id first and its slug second, for the same reason the tenant
+            // scope matches both: the id is what the request carries, the slug is what an operator
+            // writes. The partition key stays the id either way, so which spelling the rule was
+            // found by never changes which bucket it counts against.
+            if (TryFindTenantModelTier(rateLimits, subject, modelId, out var tenantModelTier, out var tenantModelTarget) &&
+                !tenantModelTier.EnforcesNothing)
+            {
+                rules.Add(Adapt(
+                    RateLimitScope.TenantModel,
+                    RateLimitKeys.TenantModel(subject.PartitionKey, modelId),
+                    tenantModelTier,
+                    factor,
+                    RateLimitLimitIds.Rule(RateLimitScopeNames.TenantModel, tenantModelTarget)));
+            }
+
+            if (!string.IsNullOrEmpty(subject.ApiKeyId) &&
+                rateLimits.ApiKeyModels.TryGetValue(RateLimitKeys.Pair(subject.ApiKeyId, modelId), out var keyModelTier) &&
+                !keyModelTier.EnforcesNothing)
+            {
+                rules.Add(Adapt(
+                    RateLimitScope.ApiKeyModel,
+                    RateLimitKeys.ApiKeyModel(subject.ApiKeyId, modelId),
+                    keyModelTier,
+                    factor,
+                    RateLimitLimitIds.Rule(
+                        RateLimitScopeNames.ApiKeyModel,
+                        RateLimitKeys.Pair(subject.ApiKeyId, modelId))));
+            }
+        }
+
+        for (var i = 0; i < rules.Count; i++)
+        {
+            if (rules[i].Policy.EnforcesTokens)
+            {
+                rules[i] = rules[i] with { TokenPartitionKey = RateLimitKeys.Tokens(rules[i].PartitionKey) };
+            }
+        }
+
+        return new RateLimitPlan([.. rules], modelStageIndex);
+    }
+
+    private static bool TryFindTenantModelTier(
+        RateLimitsConfigSection rateLimits,
+        in RateLimitSubject subject,
+        string modelId,
+        out RateLimitPolicy tier,
+        out string target)
+    {
+        // The target the rule was found under is handed back because it is the rule's identity: a
+        // rule written against the slug and one written against the id are different rules.
+        if (!string.IsNullOrEmpty(subject.TenantId))
+        {
+            target = RateLimitKeys.Pair(subject.TenantId, modelId);
+            if (rateLimits.TenantModels.TryGetValue(target, out tier!))
+            {
+                return true;
+            }
+        }
+
+        if (!string.IsNullOrEmpty(subject.TenantSlug))
+        {
+            target = RateLimitKeys.Pair(subject.TenantSlug, modelId);
+            if (rateLimits.TenantModels.TryGetValue(target, out tier!))
+            {
+                return true;
+            }
+        }
+
+        tier = default!;
+        target = string.Empty;
+        return false;
+    }
+
+    /// <summary>
+    /// A model-scoped rule with the governor's reduction applied, keeping the configured rate
+    /// alongside it so a report can show both.
+    /// </summary>
+    private static RateLimitRule Adapt(
+        RateLimitScope scope,
+        string partitionKey,
+        RateLimitPolicy tier,
+        double factor,
+        string limitId)
+    {
+        var rule = factor >= 1.0
+            ? new RateLimitRule(scope, partitionKey, tier)
+            : new RateLimitRule(scope, partitionKey, tier.Scale(factor), tier.Rpm, factor);
+
+        return rule with { LimitId = limitId, StreamLimitId = limitId };
+    }
+
+    /// <param name="ConfigVersion">
+    /// Bumped by every admin write, so a change to any tier invalidates every cached plan at once
+    /// rather than leaving some requests enforced against the old numbers.
+    /// </param>
+    /// <param name="FactorStep">The quantised adaptive factor for <paramref name="ModelId"/>.</param>
+    /// <param name="Anonymous">Whether the subject is held to the anonymous tier.</param>
+    /// <param name="EffectiveVersion">
+    /// Bumped whenever a scheduled window begins or ends, so a plan built against the tier a window
+    /// put in force is not served once that window is over.
+    /// </param>
+    private readonly record struct PlanCacheKey(
+        long ConfigVersion,
+        long EffectiveVersion,
+        string PartitionKey,
+        string? TenantId,
+        string? TenantSlug,
+        string? PlanSlug,
+        string? ApiKeyId,
+        string? ModelId,
+        int FactorStep,
+        bool Anonymous);
+}

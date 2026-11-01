@@ -1,0 +1,390 @@
+using Autobahn.Api.Models;
+using Autobahn.Api.Services;
+using Autobahn.Application.Abstractions;
+using Autobahn.Domain.Models;
+
+namespace Autobahn.Api.Tests.Services;
+
+public sealed class ModelsApiServiceTests
+{
+    [Fact]
+    public void ListHealthyModels_ExcludesUnhealthyBackends()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.GetAllModels().Returns(
+        [
+            new ModelConfig { Id = "healthy-a", Url = "http://a" },
+            new ModelConfig { Id = "sick-b", Url = "http://b" },
+        ]);
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy("healthy-a").Returns(true);
+        health.IsBackendHealthy("sick-b").Returns(false);
+
+        var grants = Substitute.For<IModelGrantService>();
+        grants.IsModelAllowedAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(true);
+        var service = new ModelsApiService(registry, health, grants);
+
+        var list = service.ListHealthyModels();
+
+        list.Data.Should().ContainSingle(m => m.Id == "healthy-a");
+        list.Object.Should().Be("list");
+    }
+
+    [Fact]
+    public void TryGetModel_WithAlias_ReturnsCanonicalId()
+    {
+        var model = new ModelConfig
+        {
+            Id = "canonical/id",
+            Url = "http://backend",
+            MaxContextLength = 4096,
+            Aliases = ["alias-name"],
+        };
+
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("alias-name", out Arg.Any<ModelConfig?>())
+            .Returns(callInfo =>
+            {
+                callInfo[1] = model;
+                return true;
+            });
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy("canonical/id").Returns(false);
+
+        var grants = Substitute.For<IModelGrantService>();
+        grants.IsModelAllowedAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(true);
+        var service = new ModelsApiService(registry, health, grants);
+
+        var (response, error) = service.TryGetModel("alias-name");
+
+        error.Should().BeNull();
+        response!.Id.Should().Be("canonical/id");
+        response.Available.Should().BeFalse();
+        response.MaxModelLen.Should().Be(4096);
+    }
+
+    [Fact]
+    public void ListAnonymousHealthyModels_DataHasPublicOnly_ModelsListsAllWithFlag()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.GetAllModels().Returns(
+        [
+            new ModelConfig { Id = "public-a", Url = "http://a", PublicAccess = true },
+            new ModelConfig { Id = "private-b", Url = "http://b" },
+        ]);
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy(Arg.Any<string>()).Returns(true);
+
+        var service = new ModelsApiService(registry, health, Substitute.For<IModelGrantService>());
+
+        var list = service.ListAnonymousHealthyModels();
+
+        list.Data.Should().ContainSingle(m => m.Id == "public-a");
+        list.Models.Should().BeEquivalentTo(
+        [
+            new ModelAvailabilityHint { Id = "public-a", ApiKeyRequired = false },
+            new ModelAvailabilityHint { Id = "private-b", ApiKeyRequired = true },
+        ]);
+    }
+
+    [Fact]
+    public void ListHealthyModels_Authenticated_OmitsModelsHint()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.GetAllModels().Returns([new ModelConfig { Id = "private-b", Url = "http://b" }]);
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy(Arg.Any<string>()).Returns(true);
+
+        var service = new ModelsApiService(registry, health, Substitute.For<IModelGrantService>());
+
+        var list = service.ListHealthyModels();
+
+        list.Data.Should().ContainSingle();
+        list.Models.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task ListHealthyModelsAsync_IncludesPublicWithoutGrantCheck()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.GetAllModels().Returns(
+        [
+            new ModelConfig { Id = "public-a", Url = "http://a", PublicAccess = true },
+            new ModelConfig { Id = "private-b", Url = "http://b" },
+        ]);
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy(Arg.Any<string>()).Returns(true);
+
+        var grants = Substitute.For<IModelGrantService>();
+        grants.IsModelAllowedAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), "private-b", Arg.Any<CancellationToken>())
+            .Returns(true);
+
+        var service = new ModelsApiService(registry, health, grants);
+        var list = await service.ListHealthyModelsAsync(Guid.NewGuid(), Guid.NewGuid());
+
+        list.Data.Select(m => m.Id).Should().BeEquivalentTo(["public-a", "private-b"]);
+        await grants.DidNotReceive()
+            .IsModelAllowedAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), "public-a", Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public void TryGetPublicModel_NonPublic_ReturnsNotFound()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("private", out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = new ModelConfig { Id = "private", Url = "http://b" };
+                return true;
+            });
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy("private").Returns(true);
+        var service = new ModelsApiService(registry, health, Substitute.For<IModelGrantService>());
+
+        var (_, error) = service.TryGetPublicModel("private");
+
+        error!.Error.Code.Should().Be("model_not_found");
+    }
+
+    [Fact]
+    public void TryGetModel_UnknownModel_ReturnsNotFoundError()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("missing", out Arg.Any<ModelConfig?>()).Returns(false);
+
+        var health = Substitute.For<IBackendHealthStore>();
+        var grants = Substitute.For<IModelGrantService>();
+        grants.IsModelAllowedAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(true);
+        var service = new ModelsApiService(registry, health, grants);
+
+        var (response, error) = service.TryGetModel("missing");
+
+        response.Should().BeNull();
+        error!.Error.Code.Should().Be("model_not_found");
+        error.Error.Type.Should().Be("invalid_request_error");
+    }
+
+    [Fact]
+    public async Task ListHealthyModelsAsync_GrantDenied_ExcludesPrivateModel()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.GetAllModels().Returns(
+        [
+            new ModelConfig { Id = "public-a", Url = "http://a", PublicAccess = true },
+            new ModelConfig { Id = "private-b", Url = "http://b" },
+            new ModelConfig { Id = "private-c", Url = "http://c" },
+        ]);
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy(Arg.Any<string>()).Returns(true);
+
+        var grants = Substitute.For<IModelGrantService>();
+        grants.IsModelAllowedAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), "private-b", Arg.Any<CancellationToken>())
+            .Returns(true);
+        grants.IsModelAllowedAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), "private-c", Arg.Any<CancellationToken>())
+            .Returns(false);
+
+        var service = new ModelsApiService(registry, health, grants);
+        var list = await service.ListHealthyModelsAsync(Guid.NewGuid(), Guid.NewGuid());
+
+        list.Data.Select(m => m.Id).Should().BeEquivalentTo(["public-a", "private-b"]);
+    }
+
+    [Fact]
+    public async Task TryGetModelAsync_GrantDenied_ReturnsNotFound()
+    {
+        var model = new ModelConfig { Id = "private-b", Url = "http://b" };
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("private-b", out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = model;
+                return true;
+            });
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy("private-b").Returns(true);
+
+        var grants = Substitute.For<IModelGrantService>();
+        grants.IsModelAllowedAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), "private-b", Arg.Any<CancellationToken>())
+            .Returns(false);
+
+        var service = new ModelsApiService(registry, health, grants);
+        var (response, error) = await service.TryGetModelAsync(
+            "private-b",
+            Guid.NewGuid(),
+            Guid.NewGuid());
+
+        response.Should().BeNull();
+        error!.Error.Code.Should().Be("model_not_found");
+    }
+
+    /// <summary>
+    /// A stopped route is invisible to callers even though the backend behind it is perfectly
+    /// healthy — the exclusion is the operator's decision, not a health verdict.
+    /// </summary>
+    [Fact]
+    public void ListHealthyModels_ExcludesStoppedModels()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.GetAllModels().Returns(
+        [
+            new ModelConfig { Id = "serving-a", Url = "http://a" },
+            new ModelConfig { Id = "stopped-b", Url = "http://b", State = ModelRouteStates.Stopped },
+        ]);
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy(Arg.Any<string>()).Returns(true);
+
+        var service = new ModelsApiService(registry, health, Substitute.For<IModelGrantService>());
+
+        service.ListHealthyModels().Data.Select(m => m.Id).Should().BeEquivalentTo(["serving-a"]);
+    }
+
+    [Fact]
+    public async Task ListHealthyModelsAsync_ExcludesStoppedModels_EvenWhenGranted()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.GetAllModels().Returns(
+        [
+            new ModelConfig { Id = "serving-a", Url = "http://a" },
+            new ModelConfig { Id = "stopped-b", Url = "http://b", State = ModelRouteStates.Stopped },
+        ]);
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy(Arg.Any<string>()).Returns(true);
+
+        var grants = Substitute.For<IModelGrantService>();
+        grants.IsModelAllowedAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(true);
+
+        var service = new ModelsApiService(registry, health, grants);
+        var list = await service.ListHealthyModelsAsync(Guid.NewGuid(), Guid.NewGuid());
+
+        list.Data.Select(m => m.Id).Should().BeEquivalentTo(["serving-a"]);
+    }
+
+    [Fact]
+    public void ListAnonymousHealthyModels_OmitsStoppedModelsFromBothViews()
+    {
+        var registry = Substitute.For<IModelRegistry>();
+        registry.GetAllModels().Returns(
+        [
+            new ModelConfig { Id = "public-a", Url = "http://a", PublicAccess = true },
+            new ModelConfig
+            {
+                Id = "stopped-public-b",
+                Url = "http://b",
+                PublicAccess = true,
+                State = ModelRouteStates.Stopped,
+            },
+        ]);
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy(Arg.Any<string>()).Returns(true);
+
+        var service = new ModelsApiService(registry, health, Substitute.For<IModelGrantService>());
+        var list = service.ListAnonymousHealthyModels();
+
+        list.Data.Select(m => m.Id).Should().BeEquivalentTo(["public-a"]);
+        // The inventory view exists to say "this model needs a key", not to advertise routes the
+        // gateway will refuse; a stopped model must not appear there either.
+        list.Models!.Select(m => m.Id).Should().BeEquivalentTo(["public-a"]);
+    }
+
+    [Theory]
+    [InlineData("stopped-b")]
+    [InlineData("stopped-alias")]
+    public void TryGetModel_Stopped_ReturnsNotFound_ByIdAndAlias(string name)
+    {
+        var model = new ModelConfig
+        {
+            Id = "stopped-b",
+            Url = "http://b",
+            Aliases = ["stopped-alias"],
+            State = ModelRouteStates.Stopped,
+        };
+
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel(name, out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = model;
+                return true;
+            });
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy("stopped-b").Returns(true);
+
+        var service = new ModelsApiService(registry, health, Substitute.For<IModelGrantService>());
+        var (response, error) = service.TryGetModel(name);
+
+        response.Should().BeNull();
+        error!.Error.Code.Should().Be("model_not_found");
+    }
+
+    [Fact]
+    public async Task TryGetModelAsync_Stopped_ReturnsNotFound()
+    {
+        var model = new ModelConfig { Id = "stopped-b", Url = "http://b", State = ModelRouteStates.Stopped };
+
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("stopped-b", out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = model;
+                return true;
+            });
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy("stopped-b").Returns(true);
+
+        var grants = Substitute.For<IModelGrantService>();
+        grants.IsModelAllowedAsync(Arg.Any<Guid>(), Arg.Any<Guid>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(true);
+
+        var service = new ModelsApiService(registry, health, grants);
+        var (response, error) = await service.TryGetModelAsync("stopped-b", Guid.NewGuid(), Guid.NewGuid());
+
+        response.Should().BeNull();
+        error!.Error.Code.Should().Be("model_not_found");
+    }
+
+    [Fact]
+    public void TryGetPublicModel_Stopped_ReturnsNotFound()
+    {
+        var model = new ModelConfig
+        {
+            Id = "stopped-public",
+            Url = "http://b",
+            PublicAccess = true,
+            State = ModelRouteStates.Stopped,
+        };
+
+        var registry = Substitute.For<IModelRegistry>();
+        registry.TryGetModel("stopped-public", out Arg.Any<ModelConfig?>())
+            .Returns(call =>
+            {
+                call[1] = model;
+                return true;
+            });
+
+        var health = Substitute.For<IBackendHealthStore>();
+        health.IsBackendHealthy("stopped-public").Returns(true);
+
+        var service = new ModelsApiService(registry, health, Substitute.For<IModelGrantService>());
+        var (response, error) = service.TryGetPublicModel("stopped-public");
+
+        response.Should().BeNull();
+        error!.Error.Code.Should().Be("model_not_found");
+    }
+}

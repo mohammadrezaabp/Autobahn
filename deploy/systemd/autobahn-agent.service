@@ -1,0 +1,21 @@
+[Unit]
+Description=Autobahn GPU and model agent
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/autobahn-agent
+ExecStart=/usr/bin/dotnet /opt/autobahn-agent/Autobahn.Agent.dll
+EnvironmentFile=/etc/autobahn/agent.env
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/autobahn-agent /srv/autobahn/models
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

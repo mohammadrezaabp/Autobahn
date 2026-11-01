@@ -1,0 +1,148 @@
+using Microsoft.Extensions.Options;
+using Autobahn.Application.Abstractions;
+using Autobahn.Domain.Configuration;
+using Autobahn.Domain.Models;
+using Autobahn.Domain.RateLimiting;
+
+namespace Autobahn.Host.DependencyInjection;
+
+/// <summary>
+/// Logs, once at startup, every gateway-side limit that can turn "the GPU is idle" into "clients
+/// are being refused or made to wait", so an operator investigating throughput reads the effective
+/// ceilings in the first screen of the log instead of reconstructing them from three config
+/// sections and the admin UI.
+/// </summary>
+/// <remarks>
+/// The rate-limit tier is read from the live snapshot, which — when a database is configured — is
+/// the value seeded on first boot and edited since through the admin UI, <em>not</em> whatever is
+/// currently in <c>appsettings.json</c>. That divergence is the usual reason a deployment is more
+/// tightly limited than its config file suggests, and is why the message spells out where the
+/// numbers came from.
+/// </remarks>
+internal sealed class GatewayAdmissionLimitsStartupLogger(
+    IOptions<GatewayOptions> options,
+    IGatewayConfigProvider configProvider,
+    IModelRegistry registry,
+    IGatewayAuthenticationState authState,
+    IHostEnvironment environment,
+    ILogger<GatewayAdmissionLimitsStartupLogger> logger,
+    IRateLimitConfigAdminService? rateLimitAdmin = null) : IHostedService
+{
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        var resilience = options.Value.Resilience;
+        var rateLimits = configProvider.Current.RateLimits;
+        var tier = rateLimits.Default;
+
+        logger.LogInformation(
+            "Admission limits: per-model bulkhead {MaxConcurrent} in flight + {MaxQueued} queued "
+            + "(queue timeout {QueueTimeout}s); rate limiting {RateLimitState}, default tier "
+            + "{Rpm} rpm + {Burst} burst, {MaxStreams} concurrent streams per partition "
+            + "(partition = tenant for API-key traffic, remote address for anonymous traffic). "
+            + "Rate-limit values come from the live config snapshot (database when configured), "
+            + "editable under Admin → Rate limits.",
+            resilience.MaxConcurrentForwardsPerModel,
+            resilience.MaxQueuedForwardsPerModel,
+            resilience.BulkheadQueueTimeoutSeconds,
+            rateLimits.Enabled ? "enabled" : "DISABLED",
+            tier.Rpm,
+            tier.Burst,
+            tier.MaxConcurrentStreams <= 0 ? "unlimited" : tier.MaxConcurrentStreams.ToString());
+
+        // The two controls that can refuse a model's traffic wholesale, for reasons unrelated to how
+        // many requests are in flight. Both cost availability when they misfire, so their effective
+        // values belong beside the concurrency ceilings rather than only in the config file.
+        logger.LogInformation(
+            "Backend availability controls: circuit breaker opens after {FailureThreshold} failures at "
+            + "{FailureRatio:P0} of outcomes in {SamplingWindow}s, stays open {BreakDuration}s, then admits one "
+            + "probe whose permit is reclaimed after {HalfOpenProbeTimeout}s if it has not reported; health "
+            + "sweep every {HealthInterval}s at {HealthTimeout}s per probe, marking a backend down after "
+            + "{UnhealthyThreshold} consecutive failed sweeps and restoring it on the first success. "
+            + "A backend that is down or breaker-open is refused at admission, so these decide how a slow "
+            + "model server degrades: gracefully, or into blanket 503s.",
+            resilience.CircuitBreakerFailureThreshold,
+            resilience.CircuitBreakerFailureRatioThreshold,
+            resilience.CircuitBreakerSamplingWindowSeconds,
+            resilience.CircuitBreakerBreakDurationSeconds,
+            resilience.CircuitBreakerHalfOpenProbeTimeoutSeconds,
+            options.Value.HealthCheckIntervalSeconds,
+            options.Value.HealthCheckTimeoutSeconds,
+            options.Value.HealthCheckUnhealthyThreshold);
+
+        if (rateLimits.Enabled &&
+            tier.MaxConcurrentStreams > 0 &&
+            tier.MaxConcurrentStreams < resilience.MaxConcurrentForwardsPerModel)
+        {
+            logger.LogWarning(
+                "The default rate-limit tier allows only {MaxStreams} concurrent streams per partition, "
+                + "below the per-model bulkhead of {MaxConcurrent}. Every API key issued from the admin "
+                + "console belongs to the same tenant and therefore shares ONE partition, so this — not "
+                + "the GPU — is the ceiling on simultaneous streaming requests for the whole deployment. "
+                + "Raise MaxConcurrentStreams (or set it to 0 to defer to the bulkhead) under "
+                + "Admin → Rate limits if the model server is being under-used.",
+                tier.MaxConcurrentStreams,
+                resilience.MaxConcurrentForwardsPerModel);
+        }
+
+        // The anonymous tier is seeded only into a fresh database — the rule seed is a one-shot —
+        // so a deployment upgraded from before it existed still holds anonymous callers to the
+        // default tier. That is thousands of requests a minute per address against a public model,
+        // and nothing else says so.
+        if (rateLimits.Enabled &&
+            authState.IsAuthenticationRequired &&
+            rateLimits.Anonymous.EnforcesNothing &&
+            registry.GetAllModels().Any(static model => model.AllowsPublicGatewayAccess()))
+        {
+            logger.LogWarning(
+                "A publicAccess model is registered and no anonymous rate-limit tier is configured, so "
+                + "every anonymous client address is held to the default tier ({Rpm} rpm + {Burst} burst). "
+                + "Add a rule with scope 'anonymous' and target '*' under Admin → Rate limits to bound "
+                + "unauthenticated callers separately.",
+                tier.Rpm,
+                tier.Burst);
+        }
+
+        // The auth-failure tier gets the same treatment as the anonymous one, and for the same
+        // reason: the scoped-rule seed is a one-shot stamped by RulesSeededAt, so a database seeded
+        // by a build that predates a scope never receives that scope's rule. With no auth-failure
+        // rule the resolver falls back to the *default* tier — sized for a paying tenant — and one
+        // address may then make thousands of credential guesses a minute with nothing saying so.
+        if (rateLimits.Enabled && authState.IsAuthenticationRequired && !rateLimits.AuthFailure.EnforcesRate)
+        {
+            logger.LogWarning(
+                "No auth-failure rate-limit tier is configured, so requests that fail authentication "
+                + "are counted against the default tier ({Rpm} rpm + {Burst} burst) per client address "
+                + "block. That is a credential-guessing allowance sized for legitimate traffic. Add a "
+                + "rule with scope 'auth_failure' and target '*' under Admin → Rate limits.",
+                tier.Rpm,
+                tier.Burst);
+        }
+
+        // The stored rules are validated once at startup, so a set that predates a validation rule —
+        // or was written by an older build — is reported rather than silently applied. Every refusal
+        // the admin API can give describes a rule that looks configured and does something other than
+        // what it says, so finding one already in the database is worth a line in the log.
+        if (rateLimitAdmin is not null &&
+            !RateLimitConfigValidation.TryValidateRules(rateLimitAdmin.GetCurrent().Rules, out var ruleError))
+        {
+            logger.LogWarning(
+                "The stored rate-limit rules would be refused if they were saved today: {Error} "
+                + "Re-save them under Admin → Rate limits; until then that rule may not enforce what "
+                + "it appears to.",
+                ruleError);
+        }
+
+        if (!options.Value.ForwardedHeaders.Enabled && !environment.IsDevelopment())
+        {
+            logger.LogInformation(
+                "Forwarded headers are disabled: behind a reverse proxy or ingress every anonymous "
+                + "caller is seen with the proxy's address and shares one rate-limit partition. Set "
+                + "Gateway:ForwardedHeaders:Enabled=true with KnownProxies/KnownNetworks if anonymous "
+                + "(publicAccess) traffic arrives through a proxy.");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+}

@@ -1,0 +1,40 @@
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Autobahn.Application.Abstractions;
+using Autobahn.Persistence.DependencyInjection;
+
+namespace Autobahn.Persistence.Tests.DependencyInjection;
+
+public sealed class PersistenceServiceCollectionExtensionsTests
+{
+    [Fact]
+    public void AddGatewayPersistence_WithoutConnectionString_DoesNotRegisterRepositories()
+    {
+        var services = new ServiceCollection();
+        var configuration = new ConfigurationBuilder().Build();
+
+        services.AddGatewayPersistence(configuration);
+
+        services.Any(d => d.ServiceType == typeof(ITenantRepository)).Should().BeFalse();
+    }
+
+    [Fact]
+    public void AddGatewayPersistence_WithConnectionString_RegistersRepositories()
+    {
+        var services = new ServiceCollection();
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                [$"ConnectionStrings:{PersistenceServiceCollectionExtensions.ConnectionStringName}"] =
+                    "Host=localhost;Database=test",
+            })
+            .Build();
+
+        services.AddGatewayPersistence(configuration);
+
+        services.Any(d => d.ServiceType == typeof(ITenantRepository)).Should().BeTrue();
+        services.Any(d => d.ServiceType == typeof(IApiKeyRepository)).Should().BeTrue();
+        services.Any(d => d.ServiceType == typeof(IModelGrantRepository)).Should().BeTrue();
+        services.Any(d => d.ServiceType == typeof(IApiKeyModelGrantRepository)).Should().BeTrue();
+    }
+}
