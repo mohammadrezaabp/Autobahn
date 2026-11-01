@@ -39,7 +39,7 @@ export function TenantModelAccess(props: { tenantId?: string; tenantName?: strin
       <div class="card-title-row">
         <div>
           <h3>Model access</h3>
-          {null}
+          
         </div>
       </div>
       <Show when={grants.loading()}><p class="loading-hint">Loading…</p></Show>
@@ -107,7 +107,7 @@ export function TenantModelAccess(props: { tenantId?: string; tenantName?: strin
 
         <Show when={grants.providers().length > 0}>
           <h3>External providers</h3>
-          {null}
+          
           <For each={grants.providers()}>
             {(p) => (
               <div class="tn-access-head">

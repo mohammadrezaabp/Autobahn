@@ -61,9 +61,9 @@ export default function SettingsPage() {
     <section class="page" id="panel-settings">
       <header class="page-header">
         <div class="titles">
-          {null}
+          
           <h2>Settings</h2>
-          {null}
+          
         </div>
         <Button variant="secondary" onClick={() => void store.load({ force: true })} disabled={store.phase() === 'loading'}>
           <span class="icon"><IconRefresh /></span> Reload all
@@ -91,7 +91,7 @@ export default function SettingsPage() {
                     </p>
                   )}
                 </Show>
-                {null}
+                
                 <div class="toolbar mb-0">
                   <Button onClick={() => setReloadConfirm(true)} disabled={store.phase() === 'loading'}>
                     <span class="icon"><IconRefresh /></span> Reload config from disk
@@ -110,7 +110,7 @@ export default function SettingsPage() {
               <div class="card">
                 <span class="eyebrow">Browser origins</span>
                 <h3>CORS allowed origins</h3>
-                {null}
+                
                 <Show when={cors.loadError()}>
                   <p class="notice error">{cors.loadError()}</p>
                 </Show>
@@ -156,7 +156,7 @@ export default function SettingsPage() {
               <div class="card">
                 <span class="eyebrow">Endpoints</span>
                 <h3>Observability</h3>
-                {null}
+                
                 <div class="link-grid">
                   <a class="action secondary" href="/metrics" target="_blank" rel="noopener">
                     <span class="icon"><IconActivity /></span> Prometheus /metrics

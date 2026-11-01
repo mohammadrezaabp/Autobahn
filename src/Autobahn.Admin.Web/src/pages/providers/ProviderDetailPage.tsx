@@ -80,7 +80,7 @@ export default function ProviderDetailPage() {
           <>
             <header class="page-header">
               <div class="titles">
-                {null}
+                
                 <h2 class="pv-title">
                   {p().displayName}
                   <span class="tag level-warning">Paid</span>
@@ -176,7 +176,7 @@ function PeakPricingNote(props: { provider: ProviderOverview }) {
     <Show when={peak()}>
       {(p) => (
         <>
-          {null}
+          
           <Show when={p().missingYear}>
             {(year) => (
               <p class="notice" classList={{ warn: p().missingIsThisYear }}>
@@ -251,7 +251,7 @@ function ModelsTab(props: { provider: ProviderOverview }) {
     <>
       <div class="card">
         <h3>Added models</h3>
-        {null}
+        
         <Show when={added()} fallback={<p class="loading-hint">Loading…</p>}>
           <Show
             when={added()!.length > 0}
@@ -295,7 +295,7 @@ function ModelsTab(props: { provider: ProviderOverview }) {
               </table>
             </div>
             <PeakPricingNote provider={props.provider} />
-            {null}
+            
           </Show>
         </Show>
       </div>
@@ -306,7 +306,7 @@ function ModelsTab(props: { provider: ProviderOverview }) {
           when={props.provider.supportsCatalog}
           fallback={null}
         >
-          {null}
+          
           <div class="toolbar">
             <label class="filter-field">
               <span class="icon"><IconSearch /></span>
@@ -394,7 +394,7 @@ function AccessTab(props: { provider: ProviderOverview }) {
   return (
     <div class="card">
       <h3>Tenants</h3>
-      {null}
+      
       <Show when={store.tenants()} fallback={<p class="loading-hint">Loading…</p>}>
         {(rows) => (
           <div class="table-wrap">
@@ -527,7 +527,7 @@ function SpendTab(props: { provider: ProviderOverview }) {
                 <span>{report().from}</span><span>cost per day</span><span>{report().to}</span>
               </p>
             </Show>
-            {null}
+            
           </div>
           <Show when={props.provider.supportsBalance && store.reconciliation()}>
             {(r) => <ReconciliationCard provider={props.provider} report={r()} />}
@@ -615,7 +615,7 @@ function ReconciliationCard(props: { provider: ProviderOverview; report: Provide
           </table>
         </div>
       </Show>
-      {null}
+      
     </div>
   );
 }
@@ -674,7 +674,7 @@ function SettingsTab(props: { provider: ProviderOverview }) {
     <>
       <div class="card form-card">
         <h3>Company key</h3>
-        {null}
+        
         <p class="notice" classList={{ warn: props.provider.keySource === 'none' }}>{source()}</p>
         <Field label="Replace the key" for="pv-key">
           <input
@@ -717,7 +717,7 @@ function SettingsTab(props: { provider: ProviderOverview }) {
           <input type="checkbox" checked={startStopped()} onChange={(e) => setStartStopped(e.currentTarget.checked)} />
           <span>Models added from the catalogue start stopped</span>
         </label>
-        {null}
+        
         <div class="card-foot-actions">
           <Button
             disabled={store.busy() || !!parsedLevel().error}

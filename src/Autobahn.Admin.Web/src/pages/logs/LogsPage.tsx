@@ -64,10 +64,10 @@ export default function LogsPage() {
     <section class="page" id="panel-logs" data-solid-root="logs">
       <div class="page-header">
         <div class="titles">
-          {null}
+          
           <h2>Logs</h2>
-          {null}
-          {null}
+          
+          
         </div>
       </div>
 
@@ -109,9 +109,7 @@ export default function LogsPage() {
         </Button>
       </div>
 
-      <Show when={truncated()}>
-        {null}
-      </Show>
+      
 
       <div class="table-wrap">
         <Show when={hasLogs()}>

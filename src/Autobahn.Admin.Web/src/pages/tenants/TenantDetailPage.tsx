@@ -307,7 +307,7 @@ export default function TenantDetailPage() {
           <>
             <header class="page-header">
               <div class="titles">
-                {null}
+                
                 <h2 class="tn-title">
                   {t().name || t().slug}
                   <Show when={t().isOperatorTenant}>
@@ -527,7 +527,7 @@ export default function TenantDetailPage() {
                           <p>{tenantKeys().length === 0 ? 'This tenant has no keys yet.' : 'No key matches these filters.'}</p>
                         </div>
                       </Show>
-                      {null}
+                      
                     </>
                   ),
                 },
@@ -558,7 +558,7 @@ export default function TenantDetailPage() {
                             {(e) => (
                               <>
                                 <TenantLimitFigures tier={e().tier} />
-                                {null}
+                                
                               </>
                             )}
                           </Show>
@@ -580,7 +580,7 @@ export default function TenantDetailPage() {
                         <div class="rl-section-head">
                           <div>
                             <h3>Rules for this tenant and its keys</h3>
-                            {null}
+                            
                           </div>
                         </div>
 
@@ -608,7 +608,7 @@ export default function TenantDetailPage() {
                           rules={rules()}
                           empty="No rule names this tenant or its keys, so the shared limit above is all that applies."
                         />
-                        {null}
+                        
                       </div>
                     </div>
                   ),
