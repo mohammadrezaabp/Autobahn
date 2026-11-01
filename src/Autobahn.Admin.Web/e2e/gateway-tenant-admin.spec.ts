@@ -52,7 +52,7 @@ test("a tenant's own admin key signs in and sees only its tenant", async ({ page
 
   await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Limits' }).click();
   const limits = page.locator('#panel-limits');
-  await expect(limits.locator('.tn-shared')).toContainText('default tier');
+  await expect(limits.locator('.tn-shared')).toContainText('3,000');
   await expect(limits.locator('.tn-shared .tn-nums')).toContainText('rpm');
   const row = limits.locator('tbody tr');
   await expect(row).toHaveCount(1);

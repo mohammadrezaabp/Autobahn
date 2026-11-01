@@ -58,9 +58,9 @@ public sealed class GatewayExceptionHandlingMiddleware(
 
             logger.LogWarning(
                 "Rejected malformed request for {Method} {Path}: {Reason}",
-                context.Request.Method,
-                context.Request.Path,
-                message);
+                LogText.OneLine(context.Request.Method),
+                LogText.OneLine(context.Request.Path.Value),
+                LogText.OneLine(message));
 
             RecordError(context, ex, GatewayLogLevel.Warning, code.ToString(), StatusCodeFor(code), message, durationMs);
             await WriteAsync(context, code).ConfigureAwait(false);
@@ -70,16 +70,16 @@ public sealed class GatewayExceptionHandlingMiddleware(
             // The client went away. Nothing to report to it, and it is not a gateway fault.
             logger.LogDebug(
                 "Client aborted {Method} {Path}",
-                context.Request.Method,
-                context.Request.Path);
+                LogText.OneLine(context.Request.Method),
+                LogText.OneLine(context.Request.Path.Value));
         }
         catch (Exception ex)
         {
             logger.LogError(
                 ex,
                 "Unhandled exception while processing {Method} {Path}",
-                context.Request.Method,
-                context.Request.Path);
+                LogText.OneLine(context.Request.Method),
+                LogText.OneLine(context.Request.Path.Value));
 
             RecordError(
                 context,
