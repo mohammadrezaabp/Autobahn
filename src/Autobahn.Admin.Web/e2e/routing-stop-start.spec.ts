@@ -22,6 +22,7 @@ test('stops a serving model after confirmation', async ({ page, request }) => {
   await expect(page.getByRole('heading', { name: 'Stop model?' })).toBeVisible();
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await expect(page.locator('.toast')).toContainText(/stop/i);
+  await expect(row.getByRole('button', { name: 'Start model' })).toBeVisible();
 });
 
 test('starts a stopped model after confirmation', async ({ page, request }) => {
@@ -39,5 +40,6 @@ test('starts a stopped model after confirmation', async ({ page, request }) => {
   await startBtn.click();
   await expect(page.getByRole('heading', { name: 'Start model?' })).toBeVisible();
   await page.getByRole('button', { name: 'Start', exact: true }).click();
-  await expect(page.locator('.toast')).toContainText(/start/i);
+  await expect(page.locator('.toast')).toContainText(/serving|start/i);
+  await expect(row.getByRole('button', { name: 'Stop model' })).toBeVisible();
 });

@@ -18,7 +18,7 @@ export function Field(props: FieldProps) {
         <label for={local.for}>{local.label}</label>
       </Show>
       {local.children}
-      {null}
+      
       <Show when={local.error}>
         <p class="field-error">{local.error}</p>
       </Show>

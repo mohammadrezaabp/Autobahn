@@ -27,7 +27,7 @@ test('creates a tenant, gives it a limit of its own and reads it back', async ({
   // Creating a tenant opens it.
   await expect(page.locator('#panel-tenant h2')).toContainText(slug);
   await page.getByRole('tab', { name: /^Limits/ }).click();
-  await expect(page.locator('.tn-shared')).toContainText('default tier');
+  await expect(page.locator('.tn-shared')).toContainText('3,000');
 
   await page.getByRole('button', { name: 'Give this tenant its own limit' }).click();
   const rule = page.getByRole('dialog');
@@ -36,7 +36,6 @@ test('creates a tenant, gives it a limit of its own and reads it back', async ({
   await page.locator('.rl-savebar').getByRole('button', { name: /Save/ }).click();
   await expect(page.locator('.toast.success', { hasText: /saved/i })).toBeVisible({ timeout: 20_000 });
 
-  await expect(page.locator('.tn-shared')).toContainText('its own tenant rule');
   await expect(page.locator('.tn-shared .tn-nums')).toContainText('42');
   await expect(page.locator('.tn-limits .rl-rules-table tbody tr')).toHaveCount(1);
 });

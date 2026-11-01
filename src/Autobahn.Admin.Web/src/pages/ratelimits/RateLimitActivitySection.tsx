@@ -71,7 +71,7 @@ export function RateLimitActivitySection() {
       <div class="rl-section-head">
         <div>
           <h3>Activity <span class="tag muted">live · in memory</span></h3>
-          {null}
+          
         </div>
         <div class="rl-activity-controls">
           <div class="rl-seg" role="group" aria-label="Activity window">
@@ -206,7 +206,7 @@ export function RateLimitActivitySection() {
                 <h4 class="rl-subhead">
                   Refusals by limit — since restart <span class="tag muted">cumulative</span>
                 </h4>
-                {null}
+                
                 <Show when={r().violations.length === 0}>
                   <p class="hint">No limit has refused a request since the gateway last started.</p>
                 </Show>
