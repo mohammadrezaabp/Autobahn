@@ -40,8 +40,8 @@ public static class FleetEndpoints
             if (!result.IsSuccess || result.Role is not (ApiKeyRole.Admin or ApiKeyRole.Both)) throw new FleetException(401, "invalid_key", "Use a valid Autobahn admin key.");
             sessions.SignIn(context, key);
             return Results.Ok(new { actor = result.TenantSlug, role = "admin" });
-        }).RequireRateLimiting("fleet-sign-in");
-        group.MapDelete("/session", (HttpContext context) => { context.Response.Cookies.Delete(FleetSessionService.CookieName, new CookieOptions { Path = "/admin/fleet" }); return Results.NoContent(); });
+        }).AllowAnonymous().RequireRateLimiting("fleet-sign-in");
+        group.MapDelete("/session", (HttpContext context) => { context.Response.Cookies.Delete(FleetSessionService.CookieName, new CookieOptions { Path = "/admin/fleet" }); return Results.NoContent(); }).WithName("FleetSessionSignOut");
         group.MapGet("/me", (HttpContext context) => Results.Ok(new { actor = context.Items["FleetActor"], role = (bool)context.Items["FleetCanWrite"]! ? "operator" : "viewer", canWrite = context.Items["FleetCanWrite"], expiresAt = ((DateTimeOffset)context.Items["FleetExpires"]!).ToUnixTimeSeconds(), version = "1.0.0" }));
         group.MapGet("/nodes", (FleetPoller poller) => Results.Json(poller.Snapshot()));
         group.MapGet("/nodes/{id}/history", (string id, FleetPoller poller) => Results.Json(poller.History(id)));
